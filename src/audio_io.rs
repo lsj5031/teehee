@@ -357,7 +357,7 @@ where
 /// nothing at runtime. Both implementors handle their own internal
 /// threading (cpal spawns its audio thread; WASAPI runs on its own
 /// worker thread the LoopbackCapturer owns).
-pub trait AudioCapture {
+pub trait AudioCapture: std::fmt::Debug {
     /// Actual sample rate, channel count, and native sample format
     /// the device opened with. Mirrors [`Capturer::config`] and
     /// [`crate::loopback::LoopbackCapturer::config`].
@@ -670,6 +670,15 @@ impl Capturer {
     pub fn stop(&self) -> anyhow::Result<()> {
         self._stream.pause()?;
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for Capturer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Capturer")
+            .field("config", &self.config)
+            .field("device_name", &self.device_name)
+            .finish()
     }
 }
 
