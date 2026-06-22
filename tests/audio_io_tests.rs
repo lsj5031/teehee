@@ -3,10 +3,15 @@
 //! tests gracefully no-op when no audio hardware is available
 //! (headless CI without an audio device).
 
+mod common;
+
 use teehee::audio_io;
 
 #[test]
 fn list_devices_returns_at_least_one_on_hosts_with_hardware() {
+    if common::is_ci() {
+        return;
+    }
     let outputs = audio_io::list_output_devices();
     let inputs = audio_io::list_input_devices();
     if outputs.is_empty() && inputs.is_empty() {
@@ -20,6 +25,9 @@ fn list_devices_returns_at_least_one_on_hosts_with_hardware() {
 
 #[test]
 fn default_output_device_is_marked_as_default() {
+    if common::is_ci() {
+        return;
+    }
     let Some(default) = audio_io::default_output_device() else {
         return;
     };
@@ -36,6 +44,9 @@ fn default_output_device_is_marked_as_default() {
 
 #[test]
 fn default_input_device_is_marked_as_default() {
+    if common::is_ci() {
+        return;
+    }
     let Some(default) = audio_io::default_input_device() else {
         return;
     };
@@ -45,7 +56,7 @@ fn default_input_device_is_marked_as_default() {
 #[test]
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn player_opens_default_output_stream() {
-    if audio_io::default_output_device().is_none() {
+    if common::is_ci() || audio_io::default_output_device().is_none() {
         return;
     }
     let player = audio_io::Player::open_default_output(|buf| {
@@ -63,7 +74,7 @@ fn player_opens_default_output_stream() {
 #[test]
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn capturer_opens_default_input_stream() {
-    if audio_io::default_input_device().is_none() {
+    if common::is_ci() || audio_io::default_input_device().is_none() {
         return;
     }
     let capturer = audio_io::Capturer::open_default_input(|_samples| {});
@@ -81,6 +92,9 @@ fn capturer_config_matches_default_input_device() {
     // echo exactly what the device's `default_input_config` reports,
     // so the sender pipeline can compute chunk math and label packets
     // from device-actual values rather than CLI defaults.
+    if common::is_ci() {
+        return;
+    }
     let Some(device_info) = audio_io::default_input_device() else {
         return;
     };
@@ -159,7 +173,7 @@ fn open_auto_input_succeeds_when_default_input_available() {
     //   3) The Box<dyn AudioCapture> dispatch returns a real
     //      capturer (its `.config()` reports a sample_rate > 0,
     //      confirming the stream actually opened).
-    if audio_io::default_input_device().is_none() {
+    if common::is_ci() || audio_io::default_input_device().is_none() {
         return;
     }
     let make_cb = || |_samples: &[f32]| {};
@@ -197,7 +211,7 @@ fn open_auto_input_factory_callable_more_than_once() {
     // audio thread (~10 ms cadence) and the helper may return
     // before the first callback, so we cannot pin closure-call
     // counts here.
-    if audio_io::default_input_device().is_none() {
+    if common::is_ci() || audio_io::default_input_device().is_none() {
         return;
     }
     let factory_call_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));

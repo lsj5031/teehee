@@ -44,6 +44,13 @@ pub fn chunk_samples(sample_rate: u32, chunk_ms: usize, channels: u8) -> usize {
     chunk_frames(sample_rate, chunk_ms) * channels as usize
 }
 
+/// True when running on a CI runner (GitHub Actions sets `CI=true`).
+/// Hardware-dependent tests should skip on CI where no real audio
+/// devices are available.
+pub fn is_ci() -> bool {
+    std::env::var("CI").is_ok()
+}
+
 /// Encode one wire packet carrying a `frequency_hz` sine at
 /// `sample_rate` across `channels`, padded to `chunk_samples`
 /// interleaved f32 samples. Returns the full wire-encoded `Vec<u8>`
