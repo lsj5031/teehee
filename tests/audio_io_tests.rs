@@ -252,8 +252,7 @@ fn open_auto_input_non_windows_surfaces_default_error_verbatim() {
         return;
     }
     let make_cb = || |_samples: &[f32]| {};
-    let err = audio_io::open_auto_input(make_cb)
-        .expect_err("open_auto_input must Err on non-Windows without default input");
+    let err = audio_io::open_auto_input(make_cb).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("Windows-only")
