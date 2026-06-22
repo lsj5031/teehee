@@ -57,6 +57,10 @@ const FRAMING_OVERHEAD_BYTES: usize = 20 + 8 + HEADER_LEN;
 
 #[test]
 fn encoded_packets_at_chunk_ms_5_stay_below_typical_mtu() {
+    // macOS GitHub Actions runners block localhost UDP — skip.
+    if cfg!(target_os = "macos") && common::is_ci() {
+        return;
+    }
     let chunk_frames = common::chunk_frames(SAMPLE_RATE_HZ, CHUNK_MS);
     let chunk_samples = common::chunk_samples(SAMPLE_RATE_HZ, CHUNK_MS, CHANNELS);
     // Wire size = header + interleaved f32 samples.
