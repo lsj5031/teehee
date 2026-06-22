@@ -62,7 +62,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::audio_io::{AudioCapture, CapturedSampleFormat, CapturerConfig};
+#[cfg(any(target_os = "windows", test))]
+use crate::audio_io::CapturedSampleFormat;
+use crate::audio_io::{AudioCapture, CapturerConfig};
 
 /// Cross-platform source trait backing loopback capture.
 pub trait LoopbackSampleSource: Send + 'static {
@@ -82,6 +84,7 @@ pub trait LoopbackSampleSource: Send + 'static {
 /// A running PCM capture stream backed by a Windows render
 /// device's loopback (WASAPI LOOPBACK). The callback receives
 /// interleaved `f32` samples.
+#[derive(Debug)]
 pub struct LoopbackCapturer {
     worker: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
