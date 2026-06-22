@@ -74,6 +74,10 @@ pub enum PushOutcome {
     /// only a long-burred late-out-of-order packet with
     /// `push.seq - head >= capacity_packets`.
     MidReadCollision,
+    /// Sender restarted: the incoming seq is far behind the play head
+    /// (gap > capacity_packets), so the jitter buffer was reset and
+    /// the packet was stored as the new anchor.
+    StreamReset,
 }
 /// Cumulative diagnostics from the jitter buffer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +112,11 @@ pub struct Stats {
     /// `raise --rx-buffer-ms` to grow the ring's `capacity_packets`,
     /// or `lower --chunk-ms` on the sender to reduce the burst rate.
     pub ring_overruns: u64,
+    /// Number of times the jitter buffer detected a sender restart
+    /// (incoming seq far behind the play head) and reset its state,
+    /// anchoring on the new stream. Non-zero means the sender process
+    /// was stopped and re-launched (or the network path changed).
+    pub sender_restarts: u64,
 }
 
 struct Slot {
@@ -178,6 +187,18 @@ impl JitterBuffer {
         }
     }
 
+    /// Reset the jitter buffer to prebuffer state, clearing all slots
+    /// and discarding the play head. Called on sender restart detection.
+    fn reset_state(&mut self) {
+        self.head = None;
+        self.head_offset = 0;
+        self.min_pushed = None;
+        for slot in &mut self.slots {
+            slot.filled = false;
+            slot.seq = 0;
+        }
+    }
+
     /// Insert a packet. Returns the classification for diagnostics.
     ///
     /// `samples.len()` must equal `samples_per_packet`. The caller is
@@ -190,11 +211,24 @@ impl JitterBuffer {
         );
         let idx = (seq as usize) % self.capacity_packets;
 
-        // Late check applies only once playback has started.
+        // Late check and sender-restart detection.
         if let Some(head) = self.head {
             if modular_is_earlier_or_equal(seq, head) {
-                self.stats.late_drops += 1;
-                return PushOutcome::Late;
+                // If the gap from seq to head is larger than the
+                // ring capacity, this isn't normal jitter — the
+                // sender likely restarted (seq reset to 1 while
+                // the receiver's play head advanced far ahead).
+                // Reset the buffer and store as the new anchor.
+                let gap = head.wrapping_sub(seq);
+                if gap > self.capacity_packets as u32 {
+                    self.reset_state();
+                    self.stats.sender_restarts += 1;
+                    // Fall through — store the packet below
+                    // (which will set min_pushed in prebuffer mode).
+                } else {
+                    self.stats.late_drops += 1;
+                    return PushOutcome::Late;
+                }
             }
 
             // Mid-read slot collision: if the slot the new seq would

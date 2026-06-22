@@ -837,6 +837,7 @@ fn spawn_periodic_receiver_stats(
                         silence_insertions = jb_stats.silence_insertions,
                         prebuffer_holds = jb_stats.prebuffer_holds,
                         ring_overruns = jb_stats.ring_overruns,
+                        sender_restarts = jb_stats.sender_restarts,
                         sender_sample_rate = state.input_rate_hz,
                         sender_channels = state.input_channels,
                         receiver_sample_rate = state.pipeline.resampler().output_rate_hz(),
@@ -857,6 +858,7 @@ fn spawn_periodic_receiver_stats(
                         silence_insertions = jb_stats.silence_insertions,
                         prebuffer_holds = jb_stats.prebuffer_holds,
                         ring_overruns = jb_stats.ring_overruns,
+                        sender_restarts = jb_stats.sender_restarts,
                         sample_rate = state.input_rate_hz,
                         channels = state.input_channels,
                         "teehee recv stats"
