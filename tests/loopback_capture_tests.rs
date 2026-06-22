@@ -167,9 +167,7 @@ fn loopback_capturer_default_errors_on_non_windows_under_public_path() {
         let r1 = teehee::loopback::LoopbackCapturer::open_default(|_packet: &[f32]| {});
         let r2 = audio_io::LoopbackCapturer::open_default(|_packet: &[f32]| {});
         for (path_name, result) in [("loopback::", &r1), ("audio_io::", &r2)] {
-            let err = result.expect_err(&format!(
-                "{path_name}LoopbackCapturer::open_default must Err on non-Windows"
-            ));
+            let err = result.as_ref().unwrap_err();
             let msg = format!("{err}");
             assert!(
                 msg.contains("Windows-only") || msg.to_lowercase().contains("wasapi"),
