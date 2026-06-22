@@ -281,6 +281,10 @@ fn sender_loop_fragmentation_counter_zero_when_packets_fit() {
 // versa) showing the production drift.
 #[test]
 fn sine_sender_loopback_fragmentations_counter_matches_overshoot_rate() {
+    // macOS GitHub Actions runners block localhost UDP — skip.
+    if cfg!(target_os = "macos") && common::is_ci() {
+        return;
+    }
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use teehee::network::{Receiver, Sender};
