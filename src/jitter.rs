@@ -279,16 +279,17 @@ impl JitterBuffer {
         // head" condition. We only count overruns in playback mode
         // (`head.is_some()`); prebuffer traffic is benign because
         // the gate hasn't released yet.
-        if self.head.is_some() && self.slots[idx].filled && self.slots[idx].seq != seq {
-            let h = self.head.unwrap();
-            let fwd = self.slots[idx].seq.wrapping_sub(h);
-            // fwd == 0: slot sits at the head's idx (just-cleared
-            //          and re-pushed race window).
-            // 0 < fwd < capacity_packets: slot is strictly future
-            //          within the ring window.
-            let cap = self.capacity_packets as u32;
-            if fwd == 0 || (fwd > 0 && fwd < cap) {
-                self.stats.ring_overruns += 1;
+        if let Some(h) = self.head {
+            if self.slots[idx].filled && self.slots[idx].seq != seq {
+                let fwd = self.slots[idx].seq.wrapping_sub(h);
+                // fwd == 0: slot sits at the head's idx (just-cleared
+                //          and re-pushed race window).
+                // 0 < fwd < capacity_packets: slot is strictly future
+                //          within the ring window.
+                let cap = self.capacity_packets as u32;
+                if fwd == 0 || (fwd > 0 && fwd < cap) {
+                    self.stats.ring_overruns += 1;
+                }
             }
         }
 
