@@ -129,6 +129,17 @@ Windows); legacy PCM-only render endpoints surface a clear error so you
 switch render devices or update teehee for PCM support in a follow-up
 slice.
 
+**Note on loopback timing.** The WASAPI loopback stream can take 5–7
+seconds to produce the first audio data after `start_stream()` — this is
+a Windows audio-engine warm-up characteristic, not a golive bug. During
+this period the sender logs `packets_sent=0`. Additionally, loopback
+capture only generates data while audio is actively being rendered on
+Windows (music, YouTube, games, system sounds). When no audio plays,
+the audio engine goes idle and data stops; it resumes automatically when
+audio starts again. There is no timeout or disconnect — the sender keeps
+polling. If you hear the audio on your headphones instead of the Mac,
+ensure `teehee recv` is running on the Mac side.
+
 For the legacy default-input path on Windows (e.g. capturing a real
 microphone), drop `--capture-source` or pass `--capture-source=default`
 instead. That path requires "Stereo Mix" (or your sound card's loopback
@@ -382,7 +393,14 @@ network pressure).
    format when needed. If you hear silence, verify the sender is still
    emitting non-empty f32 packets and that the receiver opened the
    expected output device.
-4. Check the firewall instructions above.
+4. Wait 5–10 seconds after starting the sender — the WASAPI loopback
+   engine takes 5–7 seconds to start producing data. Check `--stats` for
+   `packets_sent` increasing.
+5. For `--capture-source=loopback`: audio must be actively playing on
+   Windows (music, YouTube, system sounds). The loopback engine goes
+   idle when no audio is rendered and resumes automatically when audio
+   starts.
+6. Check the firewall instructions above.
 
 ### Sender reports `connect failed` immediately
 

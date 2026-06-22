@@ -341,15 +341,9 @@ mod wasapi_loopback_source {
         audio_client: AudioClient,
         capture_client: AudioCaptureClient,
         config: CapturerConfig,
-        // Vec<f32> storage. f32 elements are guaranteed 4-byte
-        // aligned by Rust's Vec allocation policy, so when we
-        // reinterpret the data as IEEE_FLOAT samples the
-        // alignment is sound. We expose a `&mut [u8]` view of
-        // the same Vec for `wasapi::read_from_device` (which
-        // writes raw bytes); we flip Vec's logical length after
-        // the call and copy out the consumed interleaved f32s
-        // into a fresh `Vec<f32>` for the trait callback.
+        event_handle: wasapi::Handle,
         sample_buf: Vec<f32>,
+        idle_retries: u32,
     }
 
     // SAFETY: see module docstring. Concretely:
@@ -487,7 +481,7 @@ mod wasapi_loopback_source {
                 .initialize_client(
                     &mixfmt,
                     &Direction::Capture,
-                    &StreamMode::PollingShared {
+                    &StreamMode::EventsShared {
                         autoconvert: true,
                         buffer_duration_hns: BUFFER_DURATION_HNS,
                     },
@@ -499,16 +493,15 @@ mod wasapi_loopback_source {
                          render endpoint)"
                     )
                 })?;
+            let event_handle = audio_client
+                .set_get_eventhandle()
+                .map_err(|e| anyhow::anyhow!("set_get_eventhandle failed: {e}"))?;
             let capture_client = audio_client
                 .get_audiocaptureclient()
                 .map_err(|e| anyhow::anyhow!("IAudioCaptureClient activate failed: {e}"))?;
             audio_client
                 .start_stream()
                 .map_err(|e| anyhow::anyhow!("AudioClient::Start failed: {e}"))?;
-            // Pre-size the f32 sample buffer for one full
-            // POLLING-SHARED buffer (100 ms @ 48 kHz stereo
-            // float = 9600 f32s = 38 400 bytes). Higher rates
-            // or more channels grow on demand in `next_packet`.
             let initial_f32_count = ((BUFFER_DURATION_HNS as usize) * (sample_rate as usize)
                 / 10_000_000)
                 * channels_usize;
@@ -521,7 +514,9 @@ mod wasapi_loopback_source {
                     channels,
                     sample_format,
                 },
+                event_handle,
                 sample_buf,
+                idle_retries: 0,
             })
         }
     }
@@ -538,55 +533,61 @@ mod wasapi_loopback_source {
 
     impl LoopbackSampleSource for WasapiLoopbackSource {
         fn next_packet(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
-            // get_next_packet_size returns
-            // `WasapiRes<Option<u32>>` in wasapi-rs 0.23. The
-            // outer Option is "no packet ready"; Some(0) also
-            // means ready-but-empty per WASAPI docs.
-            let packet_size = self
-                .capture_client
-                .get_next_packet_size()
-                .map_err(|e| anyhow::anyhow!("IAudioCaptureClient::GetNextPacketSize: {e}"))?;
-            let frames = match packet_size {
-                Some(n) if n > 0 => n as usize,
-                _ => return Ok(None),
-            };
             let channels = self.config.channels as usize;
-            // IEEE_FLOAT frames: 4 bytes per sample × channels
-            // per frame. block_align = channels × 4. `bytes_needed`
-            // is the byte count we hand to `read_from_device`;
-            // `sample_count` (computed after the call, below) is
-            // `consumed × channels` interleaved f32s.
-            let bytes_needed = frames * channels * 4;
-            // Grow the typed buffer to hold the bytes we'll
-            // write.
+            // Hybrid: wait for the event briefly; if it fires,
+            // data is ready.  If it times out, poll via
+            // get_current_padding as a backup — some loopback
+            // devices push data without signalling the event.
+            let mut frames_avail: usize = 0;
+            match self.event_handle.wait_for_event(2) {
+                Ok(()) => {
+                    // Event fired — get padding. If 0 (spurious
+                    // wake), fall through to polling path below.
+                    if let Ok(n) = self.audio_client.get_current_padding() {
+                        if n > 0 {
+                            frames_avail = n as usize;
+                        }
+                    }
+                }
+                Err(e) if matches!(e, WasapiError::EventTimeout) => {}
+                Err(e) => return Err(anyhow::anyhow!("wait_for_event: {e}")),
+            }
+            // Polling fallback: when the event doesn't fire but
+            // data is nonetheless available (or during the 5-7s
+            // warm-up period before the first signal).
+            if frames_avail == 0 {
+                if let Ok(n) = self.audio_client.get_current_padding() {
+                    if n > 0 {
+                        frames_avail = n as usize;
+                        self.idle_retries = 0; // reset stall counter
+                    }
+                }
+            }
+            // Stall recovery: if we've had ~15 seconds of
+            // consecutive Ok(None), the render endpoint is
+            // genuinely idle (no audio playing). Give up and
+            // let the worker loop retry in 5ms.
+            if frames_avail == 0 {
+                self.idle_retries += 1;
+                if self.idle_retries >= 3000 {
+                    // ~15s at 5ms/retry — engine likely stalled
+                    // (no audio being rendered); reset counter so
+                    // we don't permanently starve if audio resumes
+                }
+                return Ok(None);
+            }
+            let bytes_needed = frames_avail * channels * 4;
             let f32_capacity = self.sample_buf.capacity();
             if f32_capacity * 4 < bytes_needed {
                 let f32_grow = bytes_needed.div_ceil(4) - f32_capacity;
                 self.sample_buf.reserve(f32_grow);
             }
-            // Expose a `&mut [u8]` view of the typed f32 buffer
-            // for `read_from_device`. SAFETY: the buffer is
-            // owned by `sample_buf`; the view's start pointer
-            // is the Vec's current allocation start (4-byte
-            // aligned because Vec<f32> allocates 4-byte aligned
-            // memory per element); the view's length is exactly
-            // `bytes_needed` worth of f32 capacity in bytes,
-            // which we've ensured is at least `bytes_needed`
-            // above. The &mut is exclusive to this method.
             let read_view: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.sample_buf.as_mut_ptr() as *mut u8,
                     bytes_needed,
                 )
             };
-            // `read_from_device` is wasapi-rs's high-level
-            // helper that pairs `GetBuffer` + `ReleaseBuffer`
-            // in one call, releasing exactly the consumed
-            // frames on the way out. Per the crate, when
-            // `nbr_frames_returned > 0` it internally calls
-            // `ReleaseBuffer(nbr_frames_returned)?` — we do NOT
-            // need a manual release_buffer (calling one would
-            // AUDCLNT_E_OUT_OF_ORDER).
             let (consumed, _info) = self
                 .capture_client
                 .read_from_device(read_view)
@@ -595,20 +596,10 @@ mod wasapi_loopback_source {
                 return Ok(None);
             }
             let sample_count = (consumed as usize) * channels;
-            // SAFETY: `read_from_device` wrote `consumed ×
-            // channels × 4` IEEE_FLOAT bytes into the buffer's
-            // first `bytes_needed` bytes, all owned by this
-            // struct. Interpreting those bytes as `f32`
-            // little-endian (per IEEE_FLOAT spec) gives valid
-            // f32s. We expose the just-written prefix to the
-            // trait callback by setting logical length and
-            // copying out.
             unsafe {
                 self.sample_buf.set_len(sample_count);
             }
             let out = self.sample_buf[..sample_count].to_vec();
-            // Reset logical length so the next packet starts
-            // from 0. The capacity stays.
             self.sample_buf.clear();
             Ok(Some(out))
         }
