@@ -147,7 +147,7 @@ fn send_with_both_positional_and_host_flag_is_rejected() {
 #[test]
 fn send_with_zero_chunk_ms_is_rejected() {
     let result = parse(&["send", "192.168.0.10", "--chunk-ms", "0"]);
-    let err = result.err().expect("--chunk-ms 0 must error");
+    let err = result.expect_err("--chunk-ms 0 must error");
     assert_eq!(
         err.kind(),
         ErrorKind::ValueValidation,
@@ -159,9 +159,7 @@ fn send_with_zero_chunk_ms_is_rejected() {
 #[test]
 fn send_with_out_of_range_port_is_rejected() {
     let result = parse(&["send", "192.168.0.10", "--port", "70000"]);
-    let err = result
-        .err()
-        .expect("--port 70000 must error (above u16 max)");
+    let err = result.expect_err("--port 70000 must error (above u16 max)");
     assert_eq!(
         err.kind(),
         ErrorKind::ValueValidation,
@@ -184,7 +182,7 @@ fn recv_defaults_are_pinned() {
 #[test]
 fn recv_with_zero_prebuffer_ms_is_rejected() {
     let result = parse(&["recv", "--prebuffer-ms", "0"]);
-    let err = result.err().expect("--prebuffer-ms 0 must error");
+    let err = result.expect_err("--prebuffer-ms 0 must error");
     assert_eq!(
         err.kind(),
         ErrorKind::ValueValidation,
@@ -208,7 +206,7 @@ fn recv_with_custom_buffer_and_stats_flag() {
 fn help_message_lists_all_three_subcommands() {
     // `--help` exits with DisplayHelp; the rendered help text mentions the
     // three primary subcommands.
-    let result = parse(&["--help"]).err().expect("`--help` errors");
+    let result = parse(&["--help"]).expect_err("`--help` errors");
     let help_text = result.to_string();
     assert!(help_text.contains("send"), "help should list `send`");
     assert!(help_text.contains("recv"), "help should list `recv`");
@@ -217,9 +215,7 @@ fn help_message_lists_all_three_subcommands() {
 
 #[test]
 fn send_help_describes_required_host_argument() {
-    let result = parse(&["send", "--help"])
-        .err()
-        .expect("`send --help` errors");
+    let result = parse(&["send", "--help"]).expect_err("`send --help` errors");
     let help_text = result.to_string();
     assert!(
         help_text.contains("--host") || help_text.contains("<HOST>") || help_text.contains("host"),

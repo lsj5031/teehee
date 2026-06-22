@@ -134,7 +134,6 @@ fn encoded_packets_at_chunk_ms_5_stay_below_typical_mtu() {
     rx_handle.join().expect("receiver thread");
 
     let measured = Arc::try_unwrap(sizes)
-        .ok()
         .expect("sizes Arc has single owner")
         .into_inner()
         .unwrap();

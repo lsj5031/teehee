@@ -556,8 +556,7 @@ mod unit {
             let mut out = vec![0.0_f32; 240];
             let n = r.process(&input, &mut out);
             assert!(n > 0, "rate pair ({ir}→{or}) produced no output");
-            for f in 0..n {
-                let v = out[f];
+            for (f, &v) in out[..n].iter().enumerate() {
                 assert!(
                     (v - 0.5).abs() < 1e-6,
                     "DC drift at ({ir}→{or}) frame {f}: {v}"
@@ -578,7 +577,7 @@ mod unit {
         let mut out = vec![0.0_f32; 6];
         let n = r.process(&input, &mut out);
         assert!(
-            n >= 4 && n <= 6,
+            (4..=6).contains(&n),
             "expected 4-6 outputs for 10 DC inputs, got {n}"
         );
         for v in &out[..n] {
@@ -737,12 +736,8 @@ mod unit {
         let mut out = vec![0.0_f32; 220];
         let n = p.process(&input, &mut out);
         assert!(n > 0);
-        for f in 0..n {
-            assert!(
-                (out[f] - 0.5).abs() < 1e-6,
-                "DC drift at frame {f}: {}",
-                out[f]
-            );
+        for (f, &v) in out[..n].iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-6, "DC drift at frame {f}: {v}",);
         }
         let s = p.stats();
         assert!(s.samples_in > 0);
@@ -755,13 +750,13 @@ mod unit {
         // a resize; verify scrambling doesn't lose samples.
         let mut p = FormatPipeline::new(48_000, 44_100, 2, 2);
         let n_frames = 10_000;
-        let input = vec![0.8_f32, -0.8_f32].repeat(n_frames);
+        let input = [0.8_f32, -0.8_f32].repeat(n_frames);
         let out_cap = (n_frames * 110 / 100) * 2 + 16;
         let mut out = vec![0.0_f32; out_cap];
         let n = p.process(&input, &mut out);
         // ceil(input * out / in) = 9188 (10000 * 110 / 100 = 11000? no,
         // we want (input * out/in) ≈ 10000 * 44100/48000 = 9187.5 → 9188).
-        let expected_n = (n_frames * 44_100 + 47_999) / 48_000;
+        let expected_n = (n_frames * 44_100).div_ceil(48_000);
         assert_eq!(
             n, expected_n,
             "resampler must produce ceiling(input * out/in) frames"

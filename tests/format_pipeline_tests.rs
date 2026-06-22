@@ -57,11 +57,10 @@ fn jitter_drain_through_pipeline_preserves_dc_across_sr_and_channels() {
         input_scratch.len(),
         "pop_frames must return out.len() per its contract"
     );
-    for f in 0..popped {
+    for (f, &val) in input_scratch[..popped].iter().enumerate() {
         assert!(
-            (input_scratch[f] - 0.5).abs() < 1e-6,
-            "queued audio must be DC = 0.5 across all {popped} input samples, got {} at {f}",
-            input_scratch[f]
+            (val - 0.5).abs() < 1e-6,
+            "queued audio must be DC = 0.5 across all {popped} input samples, got {val} at {f}",
         );
     }
 
@@ -84,10 +83,9 @@ fn jitter_drain_through_pipeline_preserves_dc_across_sr_and_channels() {
         written == expected || written == expected - 1 || written == expected + 1,
         "expected {expected} ±1 output frames (resampler carry boundary), got {written}"
     );
-    for f in 0..written {
+    for (f, &v) in output[..written].iter().enumerate() {
         // (L + R) avg for DC stereo = (0.5 + 0.5) / 2 = 0.5; resampler
         // passes DC straight through (tested separately in unit).
-        let v = output[f];
         assert!((v - 0.5).abs() < 1e-5, "DC drift at output frame {f}: {v}");
     }
 
@@ -194,8 +192,7 @@ fn scratch_sizing_2x_downsample_to_mono() {
         written == expected || written == expected - 1 || written == expected + 1,
         "expected {expected} ±1 output frames for 2x downsample, got {written}"
     );
-    for f in 0..written {
-        let v = output[f];
+    for (f, &v) in output[..written].iter().enumerate() {
         assert!(
             (v - 0.7).abs() < 1e-5,
             "DC drift at 2x-downsample output frame {f}: {v}"

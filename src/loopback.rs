@@ -549,7 +549,7 @@ mod wasapi_loopback_source {
                         }
                     }
                 }
-                Err(e) if matches!(e, WasapiError::EventTimeout) => {}
+                Err(WasapiError::EventTimeout) => {}
                 Err(e) => return Err(anyhow::anyhow!("wait_for_event: {e}")),
             }
             // Polling fallback: when the event doesn't fire but

@@ -80,7 +80,7 @@ mod unit {
         let mut out = vec![0.0_f32; 4800]; // 2400 stereo frames
         src.fill_chunk(&mut out);
         for (i, &s) in out.iter().enumerate() {
-            assert!(s >= -1.0 && s <= 1.0, "sample {i} out of range: {s}");
+            assert!((-1.0..=1.0).contains(&s), "sample {i} out of range: {s}");
         }
     }
 
