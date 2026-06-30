@@ -101,6 +101,11 @@ colliding slot — a much rarer signature).
 reasonable starting point; smaller values give lower latency but higher
 packet rate. Default format is 48 kHz stereo f32.
 
+`--sample-rate` and `--channels` control the format for `--sine` dry-run
+mode only. For real capture (no `--sine`), the cpal / WASAPI device's
+actual sample rate and channel count are used and the CLI values are
+silently overridden (the startup log shows the divergence).
+
 `--mtu` (slice 9) sets the link MTU (default 1500, range [576, 9000]).
 The sender is MTU-aware: it logs the configured MTU, its derived
 `max_payload_bytes` envelope, and the current chunk-ms × audio-params
@@ -207,9 +212,9 @@ deployment based on which trade-off fits your workflow:
   regular auto-probe-and-fail flow on Windows.
 
   ```bash
-  # Bash / Zsh: export the env var (or prefix the binary invocation)
+  # Git Bash / MSYS2 on Windows: export the env var, then run
   export TEEHEE_STRICT_LOOPBACK=1
-  .\teehee.exe send --host <peer-ip> --capture-source=auto --stats
+  ./teehee.exe send --host <peer-ip> --capture-source=auto --stats
   # startup info label: WASAPI loopback (strict)
   ```
 
