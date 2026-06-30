@@ -464,8 +464,16 @@ impl FormatPipeline {
         );
 
         // Resize scratch on overflow so we never silently truncate.
-        // Worst case: 2× upsample + 1 seed frame.
-        let needed_scratch_frames = input.len() / ic * 2 + 1;
+        // The resampler's intermediate buffer is still in input-channel
+        // layout but must be able to hold as many *frames* as the caller's
+        // final output buffer can accept. Do not assume a 2× maximum
+        // upsample ratio here: real devices can legitimately pair a low-rate
+        // sender (for example 8 kHz telephony) with a high-rate output device
+        // (for example 192 kHz), and a fixed 2× scratch cap would make the
+        // pipeline write only the first few frames and zero-fill the rest.
+        let output_capacity_frames = out.len() / oc;
+        let ratio_bound_frames = input.len() / ic * 2 + 1;
+        let needed_scratch_frames = output_capacity_frames.max(ratio_bound_frames);
         if self.scratch.len() / ic < needed_scratch_frames {
             self.scratch.resize(needed_scratch_frames * ic, 0.0);
         }
@@ -766,6 +774,27 @@ mod unit {
             let r = out[f * 2 + 1];
             assert!((l - 0.8).abs() < 1e-6, "DC drift on L at {f}: {l}");
             assert!((r + 0.8).abs() < 1e-6, "DC drift on R at {f}: {r}");
+        }
+    }
+
+    #[test]
+    fn pipeline_high_ratio_upsample_fills_output_capacity() {
+        // Regression: the intermediate scratch buffer used to assume a
+        // worst-case 2× upsample. That silently truncated legitimate
+        // high-ratio conversions like 8 kHz input into a 192 kHz output
+        // device, then the caller zero-filled most of the output callback.
+        let mut p = FormatPipeline::new(8_000, 192_000, 1, 1);
+        let input = vec![0.25_f32; 21];
+        let mut out = vec![0.0_f32; 480];
+
+        let n = p.process(&input, &mut out);
+
+        assert_eq!(
+            n, 480,
+            "24× upsample should fill the caller's output capacity"
+        );
+        for (f, &v) in out[..n].iter().enumerate() {
+            assert!((v - 0.25).abs() < 1e-6, "DC drift at frame {f}: {v}");
         }
     }
 }
