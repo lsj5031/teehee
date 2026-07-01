@@ -38,7 +38,8 @@ use tracing::{info, warn};
 use teehee::audio_io;
 use teehee::audio_io::{AudioCapture, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
-use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, SendArgs};
+use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, ResolvedTarget, SendArgs};
+use teehee::discovery;
 use teehee::format_pipeline::FormatPipeline;
 use teehee::generated::SineSource;
 use teehee::jitter::JitterBuffer;
@@ -76,7 +77,18 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // `chunk_samples` (= chunk_frames * channels) is computed inline at
     // the two use-sites below; no need for a top-level binding here.
 
-    let target_str = target.to_socket_string();
+    // Slice 12: resolve mDNS before the hot path / capture. The
+    // discovery timeout blocks only at startup (acceptable); the
+    // returned SocketAddr carries the port from the SRV record.
+    let target_str = match target {
+        ResolvedTarget::Explicit { host, port } => format!("{}:{}", host, port),
+        ResolvedTarget::Mdns { timeout_ms } => {
+            let timeout = Duration::from_millis(timeout_ms);
+            discovery::resolve_with_timeout(timeout)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .to_string()
+        }
+    };
     info!(target = %target_str, sample_rate, channels, chunk_ms, mtu = args.mtu, "teehee send connecting");
     let tx = Sender::connect(&target_str)?;
 
@@ -471,11 +483,36 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     args.validate().map_err(anyhow::Error::msg)?;
     let addr = ("0.0.0.0", args.port);
     let rx = Receiver::bind(addr)?;
+    // Slice 12: advertise only *after* the UDP bind succeeds. Use the
+    // actual bound port (supports --port 0 if ever allowed).
+    let _advertiser = if args.mdns {
+        let port = rx.local_addr()?.port();
+        match discovery::Advertiser::advertise(port, "teehee", "teehee.local.") {
+            Ok(adv) => Some(adv),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "UDP receive socket is bound on {} but mDNS advertisement failed: {}",
+                    rx.local_addr()?, e
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    if args.mdns {
+        // Best-effort log (the actual advertisement happened above).
+        if let Ok(addr) = rx.local_addr() {
+            info!(service = "_teehee._udp.local.", advertised_addr = %addr, "mDNS advertisement active");
+        }
+    }
+
     info!(
         local_addr = ?rx.local_addr()?,
         port = args.port,
         prebuffer_ms = args.prebuffer_ms,
         rx_buffer_ms = args.rx_buffer_ms,
+        mdns_advertising = args.mdns,
         "teehee recv listening"
     );
 
