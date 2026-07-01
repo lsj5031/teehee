@@ -17,6 +17,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+mdns-sd = "0.7"
 
 # Slice 8 (Tier 3 #1) — Windows-only WASAPI loopback capture. Conditional on
 # target_os = "windows" so macOS/Linux builds are unaffected. The Rust API
