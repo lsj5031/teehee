@@ -39,10 +39,3 @@ pub mod protocol;
 
 pub use loopback::LoopbackCapturer;
 pub use protocol::{Packet, SampleFormat, HEADER_LEN, MAGIC, VERSION};
-
-// --- spike modules live below this line ---------------------------------
-// Spike: fixed-capacity jitter buffer pattern borrowed from neoeinstein/aliri
-// (rolling-sum jitter, O(1) read, no allocator on hot path). Compiled but
-// not yet wired into runtime. Promote to `jitter::buffer` after a `cargo bench`.
-#[allow(dead_code)]
-pub mod spike_packet_ring;
