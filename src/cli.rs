@@ -28,6 +28,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Capture (or generate) audio and ship it to the receiver.
+    /// Use --host (or positional) for explicit target, or --mdns for LAN discovery.
     #[command(
         name = "send",
         about = "Capture (or generate) audio and ship it to the receiver.",
@@ -73,14 +74,19 @@ pub enum Command {
                      --sample-rate and --channels apply ONLY to --sine dry-run mode. \
                      For real capture, the cpal / WASAPI device's actual sample rate \
                      and channel count are used; if they differ from the CLI values, \
-                     the mismatch is surfaced at startup so the divergence is visible."
+                     the mismatch is surfaced at startup so the divergence is visible.\n\n\
+                     Discovery (slice 12): instead of --host, you may use --mdns to \
+                     automatically discover a receiver advertising via mDNS on the \
+                     local network. The receiver side must also be started with \
+                     --mdns. Manual --host addressing remains fully supported."
     )]
     Send(SendArgs),
     /// Listen on a UDP port and play audio on the default output device.
-    /// Format reconciliation is automatic (slice 7): if the sender's
-    /// sample rate or channel count differs from the receiver's cpal
-    /// default output device, the receiver transparently resamples
-    /// (linear interpolation — voice-grade for LAN ratios) and
+    /// Use --mdns to advertise this receiver on the LAN for discovery
+    /// by senders. Format reconciliation is automatic (slice 7): if
+    /// the sender's sample rate or channel count differs from the
+    /// receiver's cpal default output device, the receiver transparently
+    /// resamples (linear interpolation — voice-grade for LAN ratios) and
     /// reconciles channels (mono↔stereo average/broadcast; defensive
     /// 1→N up-mix and N→M down-mix for unusual layouts). No CLI
     /// flag is required; the receiver auto-discovers formats from
@@ -95,17 +101,19 @@ pub enum Command {
 
 /// Configuration for the `send` subcommand.
 ///
-/// Either the positional `HOST` argument OR the `--host` flag must be
-/// supplied; supplying both is rejected. The `HOST` field may also
-/// embed a port in `host:port` form — that port is used unless
-/// `--port` is also explicitly set, in which case the call is
-/// rejected with an "ambiguous port" error rather than silently
-/// doubling into `host:port:port`.
+/// Destination may be supplied via positional HOST or --host, or
+/// --mdns for discovery (mutually exclusive with host). The `HOST`
+/// field may also embed a port in `host:port` form — that port is
+/// used unless `--port` is also explicitly set, in which case the
+/// call is rejected with an "ambiguous port" error rather than
+/// silently doubling into `host:port:port`.
 #[derive(Debug, Args)]
 pub struct SendArgs {
     /// Destination host — IPv4/IPv6 literal or hostname. May also
     /// embed a port in `host:port` form (e.g. `192.168.0.10:6000`).
-    /// Either this positional OR `--host` is required.
+    /// Either this positional OR `--host` is required for explicit
+    /// addressing. Alternatively pass `--mdns` to discover a receiver
+    /// via mDNS on the LAN (the SRV record supplies the address+port).
     #[arg(value_name = "HOST")]
     pub host: Option<String>,
 
@@ -117,6 +125,8 @@ pub struct SendArgs {
     /// UDP destination port. Defaults to 5000; if the `HOST` field
     /// already encodes a port (`host:port`), `--port` MUST be left
     /// at its default or the call is rejected as ambiguous.
+    /// When using --mdns the port comes from the discovered SRV record
+    /// (this flag is ignored for the target address).
     #[arg(long, default_value_t = 5000, value_parser = parse_port)]
     pub port: u16,
 
@@ -198,6 +208,19 @@ pub struct SendArgs {
     /// (preserving v1 behaviour).
     #[arg(long, default_value_t = false)]
     pub exact_capture_source: bool,
+
+    /// Opt-in mDNS discovery for the receiver (slice 12). When set,
+    /// --host must not be supplied; the sender browses for the first
+    /// `_teehee._udp.local.` service and uses the SRV record's
+    /// address+port. Discovery timeout is controlled by
+    /// --mdns-timeout-ms.
+    #[arg(long)]
+    pub mdns: bool,
+
+    /// Maximum time to wait for mDNS discovery when --mdns is used.
+    /// Range 1..=60000 ms.
+    #[arg(long, default_value_t = 3_000, value_parser = parse_mdns_timeout_ms)]
+    pub mdns_timeout_ms: u64,
 }
 
 /// Capture-source selector for `teehee send`. Slice 8 added the
@@ -289,6 +312,14 @@ pub struct RecvArgs {
     /// slice-6 to keep operators' grep muscle memory intact.
     #[arg(long)]
     pub stats: bool,
+
+    /// Opt-in mDNS advertisement (slice 12). When set, after the UDP
+    /// receiver successfully binds, an mDNS advertiser is started so
+    /// `--mdns` senders on the LAN can discover this receiver without
+    /// an explicit --host. The advertisement is RAII-held for the
+    /// lifetime of the recv session.
+    #[arg(long)]
+    pub mdns: bool,
 }
 
 // Validation hooks: clap's `value_parser` covers prebuffer_ms above;
@@ -372,19 +403,68 @@ fn parse_port(s: &str) -> Result<u16, String> {
     Ok(n as u16)
 }
 
+/// Parse `--mdns-timeout-ms` (sender side only). Minimum 1 ms to
+/// reject zero-duration lookups; maximum 60 000 ms to prevent
+/// accidental long hangs at startup. Errors name the flag and the
+/// supported range.
+fn parse_mdns_timeout_ms(s: &str) -> Result<u64, String> {
+    let n: u64 = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if n < 1 {
+        return Err("mdns-timeout-ms must be in 1..=60000 (got 0 or less)".into());
+    }
+    if n > 60_000 {
+        return Err(format!("mdns-timeout-ms must be in 1..=60000 (got {n})"));
+    }
+    Ok(n)
+}
+
 /// A destination resolved from `SendArgs`. Returned by
 /// [`SendArgs::validate`] so `run_send` formats a single
-/// `host:port` string with no further logic.
+/// `host:port` string with no further logic (or performs mDNS
+/// resolution for the `Mdns` variant).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedTarget {
-    pub host: String,
-    pub port: u16,
+pub enum ResolvedTarget {
+    Explicit { host: String, port: u16 },
+    Mdns { timeout_ms: u64 },
 }
 
 impl ResolvedTarget {
-    /// `host:port` form ready for `Sender::connect`.
-    pub fn to_socket_string(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    pub fn explicit(host: impl Into<String>, port: u16) -> Self {
+        ResolvedTarget::Explicit {
+            host: host.into(),
+            port,
+        }
+    }
+
+    pub fn mdns(timeout_ms: u64) -> Self {
+        ResolvedTarget::Mdns { timeout_ms }
+    }
+
+    /// Returns the host for Explicit targets; None for mDNS (resolved later).
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            ResolvedTarget::Explicit { host, .. } => Some(host.as_str()),
+            ResolvedTarget::Mdns { .. } => None,
+        }
+    }
+
+    /// Returns the port for Explicit targets; None for mDNS (from SRV).
+    pub fn port(&self) -> Option<u16> {
+        match self {
+            ResolvedTarget::Explicit { port, .. } => Some(*port),
+            ResolvedTarget::Mdns { .. } => None,
+        }
+    }
+
+    /// `host:port` form ready for `Sender::connect`. Returns None for
+    /// Mdns variant (resolution happens in run_send before connect).
+    pub fn to_socket_string(&self) -> Option<String> {
+        match self {
+            ResolvedTarget::Explicit { host, port } => Some(format!("{}:{}", host, port)),
+            ResolvedTarget::Mdns { .. } => None,
+        }
     }
 }
 
@@ -464,10 +544,11 @@ impl RecvArgs {
 }
 
 impl SendArgs {
-    /// Validate parsed args and return a resolved `host:port` target.
+    /// Validate parsed args and return a ResolvedTarget (explicit or mDNS).
     /// Range-checks `channels` / `chunk-ms` AND reconciles the
     /// positional `HOST` argument with the `--host` flag AND any
-    /// `host:port`-embedded port against `--port`.
+    /// `host:port`-embedded port against `--port`. --mdns is
+    /// accepted as alternative to explicit host (mutually exclusive).
     pub fn validate(&self) -> Result<ResolvedTarget, String> {
         if self.channels == 0 || self.channels > 8 {
             return Err(format!("channels must be in 1..=8 (got {})", self.channels));
@@ -498,6 +579,16 @@ impl SendArgs {
             );
         }
 
+        // Slice 12: mDNS discovery is mutually exclusive with explicit host.
+        let host_is_set = self.host.is_some() || self.host_flag.is_some();
+        if self.mdns && host_is_set {
+            return Err("--mdns cannot be combined with --host (or positional HOST)".into());
+        }
+        if self.mdns {
+            // mdns_timeout_ms already range-checked by clap value_parser.
+            return Ok(ResolvedTarget::mdns(self.mdns_timeout_ms));
+        }
+
         // Source the host string from exactly one of the two fields.
         let raw_host = match (self.host.as_deref(), self.host_flag.as_deref()) {
             (Some(h), None) => h,
@@ -508,7 +599,7 @@ impl SendArgs {
                 );
             }
             (None, None) => {
-                return Err("destination host required (pass positional HOST or --host)".into());
+                return Err("destination host required (pass --host <ip> or --mdns)".into());
             }
         };
 
@@ -525,7 +616,7 @@ impl SendArgs {
             (None, p) => p,
         };
 
-        Ok(ResolvedTarget { host, port })
+        Ok(ResolvedTarget::explicit(host, port))
     }
 }
 
@@ -551,6 +642,9 @@ mod unit {
             // the v1 / slice-8 / slice-10 behaviour is unchanged
             // across pre-existing tests.
             exact_capture_source: false,
+            // Slice 12: mDNS opt-in; existing tests use explicit host.
+            mdns: false,
+            mdns_timeout_ms: 3_000,
         }
     }
 
@@ -561,8 +655,8 @@ mod unit {
         let t = make_args(Some("127.0.0.1"), None, 5000)
             .validate()
             .expect("ok");
-        assert_eq!(t.host, "127.0.0.1");
-        assert_eq!(t.port, 5000);
+        assert_eq!(t.host(), Some("127.0.0.1"));
+        assert_eq!(t.port(), Some(5000));
     }
 
     #[test]
@@ -588,8 +682,8 @@ mod unit {
         let t = make_args(None, Some("10.0.0.5"), 5000)
             .validate()
             .expect("ok");
-        assert_eq!(t.host, "10.0.0.5");
-        assert_eq!(t.port, 5000);
+        assert_eq!(t.host(), Some("10.0.0.5"));
+        assert_eq!(t.port(), Some(5000));
     }
 
     #[test]
@@ -597,8 +691,8 @@ mod unit {
         let t = make_args(Some("10.0.0.5:6000"), None, 5000)
             .validate()
             .expect("ok");
-        assert_eq!(t.host, "10.0.0.5");
-        assert_eq!(t.port, 6000);
+        assert_eq!(t.host(), Some("10.0.0.5"));
+        assert_eq!(t.port(), Some(6000));
     }
 
     #[test]
@@ -606,8 +700,8 @@ mod unit {
         let t = make_args(None, Some("10.0.0.5:6000"), 5000)
             .validate()
             .expect("ok");
-        assert_eq!(t.host, "10.0.0.5");
-        assert_eq!(t.port, 6000);
+        assert_eq!(t.host(), Some("10.0.0.5"));
+        assert_eq!(t.port(), Some(6000));
     }
 
     #[test]
@@ -737,8 +831,8 @@ mod unit {
             panic!("expected Send subcommand");
         };
         let t = args.validate().expect("validate ok");
-        assert_eq!(t.host, "10.0.0.5");
-        assert_eq!(t.port, 6000);
+        assert_eq!(t.host(), Some("10.0.0.5"));
+        assert_eq!(t.port(), Some(6000));
     }
 
     #[test]
@@ -753,11 +847,25 @@ mod unit {
 
     #[test]
     fn resolved_target_socket_string_formatting() {
-        let t = ResolvedTarget {
-            host: "10.0.0.5".into(),
-            port: 6000,
-        };
-        assert_eq!(t.to_socket_string(), "10.0.0.5:6000");
+        let t = ResolvedTarget::explicit("10.0.0.5", 6000);
+        assert_eq!(t.to_socket_string(), Some("10.0.0.5:6000".to_string()));
+    }
+
+    // ----- Slice 12: mDNS target representation -----
+    #[test]
+    fn resolved_target_mdns_has_no_socket_string_before_resolution() {
+        let t = ResolvedTarget::mdns(3000);
+        assert!(t.host().is_none());
+        assert!(t.port().is_none());
+        assert!(t.to_socket_string().is_none());
+    }
+
+    #[test]
+    fn resolved_target_explicit_socket_string_matches_host_port() {
+        let t = ResolvedTarget::explicit("192.168.0.10", 5000);
+        assert_eq!(t.host(), Some("192.168.0.10"));
+        assert_eq!(t.port(), Some(5000));
+        assert_eq!(t.to_socket_string(), Some("192.168.0.10:5000".to_string()));
     } // ----- Slice 8: CaptureSource enum -----
     #[test]
     fn capture_source_default_value_is_default() {
@@ -955,8 +1063,8 @@ mod unit {
         let mut args = make_args(Some("127.0.0.1"), None, 5000);
         args.capture_source = CaptureSource::Auto;
         let resolved = args.validate().expect("validate ok");
-        assert_eq!(resolved.host, "127.0.0.1");
-        assert_eq!(resolved.port, 5000);
+        assert_eq!(resolved.host(), Some("127.0.0.1"));
+        assert_eq!(resolved.port(), Some(5000));
         assert_eq!(
             args.capture_source,
             CaptureSource::Auto,
@@ -1003,7 +1111,7 @@ mod unit {
         let resolved = args
             .validate()
             .expect("--exact-capture-source + --capture-source=default must validate");
-        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.host(), Some("127.0.0.1"));
     }
 
     #[test]
@@ -1014,7 +1122,7 @@ mod unit {
         let resolved = args
             .validate()
             .expect("--exact-capture-source + --capture-source=loopback must validate");
-        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.host(), Some("127.0.0.1"));
     }
 
     #[test]
@@ -1031,7 +1139,7 @@ mod unit {
             "omitted --exact-capture-source + --capture-source=auto must validate \
                  (v1 compat: strict-mode is opt-in)",
         );
-        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.host(), Some("127.0.0.1"));
     }
 
     #[test]
@@ -1264,6 +1372,94 @@ mod unit {
         assert!(res.is_ok());
     }
 
+    // ----- Slice 12: mDNS flags and validation -----
+
+    #[test]
+    fn send_validate_accepts_mdns_without_host() {
+        let mut args = make_args(None, None, 5000);
+        args.mdns = true;
+        let t = args.validate().expect("mdns without host is valid");
+        assert!(matches!(t, ResolvedTarget::Mdns { timeout_ms: 3000 }));
+    }
+
+    #[test]
+    fn send_validate_rejects_missing_host_without_mdns() {
+        let err = make_args(None, None, 5000).validate().unwrap_err();
+        assert!(err.contains("destination host required"));
+    }
+
+    #[test]
+    fn send_validate_rejects_mdns_and_host_together() {
+        let mut args = make_args(Some("127.0.0.1"), None, 5000);
+        args.mdns = true;
+        let err = args.validate().unwrap_err();
+        assert!(err.contains("--mdns"));
+        assert!(err.contains("--host"));
+    }
+
+    #[test]
+    fn send_validate_returns_mdns_target_with_timeout() {
+        let mut args = make_args(None, None, 5000);
+        args.mdns = true;
+        args.mdns_timeout_ms = 1234;
+        let t = args.validate().expect("ok");
+        match t {
+            ResolvedTarget::Mdns { timeout_ms } => assert_eq!(timeout_ms, 1234),
+            _ => panic!("expected Mdns"),
+        }
+    }
+
+    #[test]
+    fn parse_mdns_timeout_ms_rejects_zero() {
+        // Direct parser (clap would also reject via value_parser)
+        let err = parse_mdns_timeout_ms("0").unwrap_err();
+        assert!(err.contains("mdns-timeout-ms"));
+    }
+
+    #[test]
+    fn parse_mdns_timeout_ms_rejects_too_large() {
+        let err = parse_mdns_timeout_ms("60001").unwrap_err();
+        assert!(err.contains("mdns-timeout-ms"));
+        assert!(err.contains("60000"));
+    }
+
+    #[test]
+    fn parse_mdns_timeout_ms_accepts_reasonable_value() {
+        assert_eq!(parse_mdns_timeout_ms("5000").unwrap(), 5000);
+        assert_eq!(parse_mdns_timeout_ms("1").unwrap(), 1);
+        assert_eq!(parse_mdns_timeout_ms("60000").unwrap(), 60000);
+    }
+
+    #[test]
+    fn recv_args_accepts_mdns_flag() {
+        let cli = Cli::try_parse_from(["teehee", "recv", "--mdns"])
+            .expect("clap must accept recv --mdns");
+        let Command::Recv(args) = cli.command else {
+            panic!("expected Recv");
+        };
+        assert!(args.mdns);
+    }
+
+    #[test]
+    fn send_mdns_does_not_require_port() {
+        // When --mdns, SRV record supplies the authoritative port; --port
+        // flag is not required for target resolution.
+        let mut args = make_args(None, None, 5000);
+        args.mdns = true;
+        // even if we set odd port, it shouldn't matter for mdns path
+        let t = args.validate().expect("mdns send without relying on port");
+        assert!(matches!(t, ResolvedTarget::Mdns { .. }));
+    }
+
+    #[test]
+    fn send_mdns_error_message_mentions_host_or_mdns() {
+        let err = make_args(None, None, 5000).validate().unwrap_err();
+        assert!(
+            err.contains("--host") || err.contains("--mdns") || err.contains("host required"),
+            "error for no-target send must mention the choices: {err}"
+        );
+    }
+
     // ----- helpers for slice 10 tests -----
 
     /// Build a default RecvArgs so we can drive `RecvArgs::validate`
@@ -1274,6 +1470,7 @@ mod unit {
             prebuffer_ms,
             rx_buffer_ms,
             stats: false,
+            mdns: false,
         }
     }
 }

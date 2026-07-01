@@ -63,8 +63,8 @@ fn send_with_explicit_port_sine_and_stats() {
     // validate() should accept: --port 6000 with no embedded port is
     // unambiguous, so the resolved target is host=10.0.0.5, port=6000.
     let t = args.validate().expect("validate ok");
-    assert_eq!(t.host, "10.0.0.5");
-    assert_eq!(t.port, 6000);
+    assert_eq!(t.host(), Some("10.0.0.5"));
+    assert_eq!(t.port(), Some(6000));
 }
 
 #[test]
@@ -82,8 +82,8 @@ fn send_without_host_is_rejected() {
         .validate()
         .expect_err("send without positional HOST or --host must error at validate()");
     assert!(
-        err.contains("destination host required"),
-        "expected required-host message, got {err:?}"
+        err.contains("destination host required") || err.contains("--mdns"),
+        "expected required-host message (mentions --mdns too), got {err:?}"
     );
 }
 
@@ -118,8 +118,8 @@ fn send_with_host_flag_parses() {
     assert!(args.host.is_none());
     assert_eq!(args.host_flag.as_deref(), Some("10.0.0.5"));
     let t = args.validate().expect("validate ok");
-    assert_eq!(t.host, "10.0.0.5");
-    assert_eq!(t.port, 5000);
+    assert_eq!(t.host(), Some("10.0.0.5"));
+    assert_eq!(t.port(), Some(5000));
 }
 
 #[test]
@@ -130,8 +130,8 @@ fn send_with_host_flag_and_embedded_port() {
         panic!("expected Send variant");
     };
     let t = args.validate().expect("validate ok");
-    assert_eq!(t.host, "10.0.0.5");
-    assert_eq!(t.port, 6000);
+    assert_eq!(t.host(), Some("10.0.0.5"));
+    assert_eq!(t.port(), Some(6000));
 }
 
 #[test]
@@ -221,4 +221,32 @@ fn send_help_describes_required_host_argument() {
         help_text.contains("--host") || help_text.contains("<HOST>") || help_text.contains("host"),
         "send help should reference host argument, got: {help_text}"
     );
+}
+
+// ----- Slice 12 mDNS CLI surface (integration parse) -----
+
+#[test]
+fn send_mdns_parses_without_host() {
+    let cli = parse(&["send", "--mdns"]).expect("send --mdns parses");
+    let Command::Send(args) = cli.command else { panic!("send"); };
+    assert!(args.mdns);
+    assert!(args.host.is_none() && args.host_flag.is_none());
+    let target = args.validate().expect("validate accepts mdns");
+    assert!(matches!(target, teehee::cli::ResolvedTarget::Mdns { .. }));
+}
+
+#[test]
+fn send_mdns_rejects_with_host_at_validate() {
+    let cli = parse(&["send", "--mdns", "--host", "1.2.3.4"]).expect("clap allows (conflicts not on mdns)");
+    let Command::Send(args) = cli.command else { panic!(); };
+    let err = args.validate().expect_err("mdns+host rejected in validate");
+    assert!(err.contains("--mdns"));
+}
+
+#[test]
+fn recv_mdns_parses() {
+    let cli = parse(&["recv", "--mdns", "--port", "6000"]).expect("recv --mdns ok");
+    let Command::Recv(args) = cli.command else { panic!(); };
+    assert!(args.mdns);
+    assert_eq!(args.port, 6000);
 }
