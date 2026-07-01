@@ -11,7 +11,8 @@ paid proprietary tools.
 * `teehee recv` — listen on a UDP port and play incoming audio through the
   default output device.
 * `teehee send --host <peer-ip>` — capture the Windows default output
-  (loopback) and stream it over UDP.
+  (loopback) and stream it over UDP. Pass `--mdns` instead of `--host`
+  to auto-resolve a receiver advertising via mDNS on the LAN (slice 12).
 * `teehee devices` — list available audio devices on this machine.
 
 It uses `cpal` for native audio access (WASAPI on Windows, CoreAudio on
@@ -237,6 +238,65 @@ strict-loopback side-effect. They are independently usable; setting
 both is well-defined (validate layer rejects `auto` first, the env
 var is never consulted).
 
+### Auto-discovery (slice 12)
+
+If you don't want to look up the receiver's IP on the LAN, both sides
+opt in with `--mdns`:
+
+```bash
+# Any receiver (Mac / Linux / Windows) — advertises after UDP bind:
+./teehee recv --port 5000 --mdns --stats
+
+# Any sender — resolves the first matching advert and uses its
+# SRV-derived IP+port:
+./teehee.exe send --mdns --stats
+```
+
+The receiver registers a `_teehee._udp.local.` SRV record through
+`mdns-sd` **after** `Receiver::bind` succeeds, so a port that failed
+to bind is never falsely advertised. The TXT record carries a sparse
+`v=1` protocol-version marker; richer metadata (sample rate,
+channels, codec) lives in the packet header, not in mDNS. The
+advertisement is RAII-held for the lifetime of `run_recv` and
+unregisters cleanly on shutdown.
+
+The sender browses `_teehee._udp.local.` for `--mdns-timeout-ms`
+(default `3000`, range `1`–`60000`) and uses the first resolved IPv4
+SocketAddr. Discovery blocks only **at startup**, never on an audio
+thread, so a slow lookup cannot interrupt playback. On timeout the
+binary exits with a message naming the timeout (so it's greppable
+against `--mdns-timeout-ms`), the looked-up service type, and the
+explicit alternative:
+
+```bash
+./teehee send --mdns
+# mDNS discovery timed out after 3000 ms for _teehee._udp.local.
+# Is the receiver running with --mdns?
+# Try raising --mdns-timeout-ms or pass --host <ip> explicitly.
+```
+
+**Mutual exclusion**: `--mdns` cannot be combined with `--host` or
+the positional `HOST` argument. The error surfaces at the validate
+step (supplied, not deferred), so misuse fails loud before any audio
+work starts:
+
+```bash
+./teehee.exe send --mdns --host 192.168.0.42
+# error: --mdns cannot be combined with --host (or positional HOST)
+
+./teehee.exe send --mdns --mdns-timeout-ms 10000
+# sender logs: teehee send connecting target=192.168.0.42:5000 ...
+# (port comes from the discovered SRV record; --port is unused here)
+```
+
+**When mDNS picks the wrong receiver.** On a LAN with multiple
+running TeeHee receivers, the sender grabs the first advert returned
+by the mDNS browse — there's no selection UI. If you have two or
+more receivers, use `--host` on the sender to point at the
+specific IP you want, or stop the unintended receivers before
+launching `--mdns` mode. Receiver identity / pairing / trust
+selection belongs to a later slice.
+
 ### Dry-run / loopback test without hardware
 
 `teehee send --host 127.0.0.1 --sine` generates a 440 Hz tone at the
@@ -343,7 +403,6 @@ receiver port to the public internet.
 * Mobile clients (iOS / Android).
 * GUI / tray / menu-bar app.
 * Encryption or authentication.
-* Multicast / mDNS / Bonjour discovery.
 * Opus / FLAC / AAC / other compression.
 * Ultra-low-latency gaming or live-performance use.
 * Fan-out (one sender to many receivers).
