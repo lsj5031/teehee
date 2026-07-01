@@ -228,7 +228,9 @@ fn send_help_describes_required_host_argument() {
 #[test]
 fn send_mdns_parses_without_host() {
     let cli = parse(&["send", "--mdns"]).expect("send --mdns parses");
-    let Command::Send(args) = cli.command else { panic!("send"); };
+    let Command::Send(args) = cli.command else {
+        panic!("send");
+    };
     assert!(args.mdns);
     assert!(args.host.is_none() && args.host_flag.is_none());
     let target = args.validate().expect("validate accepts mdns");
@@ -237,8 +239,11 @@ fn send_mdns_parses_without_host() {
 
 #[test]
 fn send_mdns_rejects_with_host_at_validate() {
-    let cli = parse(&["send", "--mdns", "--host", "1.2.3.4"]).expect("clap allows (conflicts not on mdns)");
-    let Command::Send(args) = cli.command else { panic!(); };
+    let cli = parse(&["send", "--mdns", "--host", "1.2.3.4"])
+        .expect("clap allows (conflicts not on mdns)");
+    let Command::Send(args) = cli.command else {
+        panic!();
+    };
     let err = args.validate().expect_err("mdns+host rejected in validate");
     assert!(err.contains("--mdns"));
 }
@@ -246,7 +251,9 @@ fn send_mdns_rejects_with_host_at_validate() {
 #[test]
 fn recv_mdns_parses() {
     let cli = parse(&["recv", "--mdns", "--port", "6000"]).expect("recv --mdns ok");
-    let Command::Recv(args) = cli.command else { panic!(); };
+    let Command::Recv(args) = cli.command else {
+        panic!();
+    };
     assert!(args.mdns);
     assert_eq!(args.port, 6000);
 }

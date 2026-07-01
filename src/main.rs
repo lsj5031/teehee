@@ -492,7 +492,8 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "UDP receive socket is bound on {} but mDNS advertisement failed: {}",
-                    rx.local_addr()?, e
+                    rx.local_addr()?,
+                    e
                 ));
             }
         }

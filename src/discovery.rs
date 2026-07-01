@@ -87,8 +87,7 @@ pub fn resolve_with_timeout(timeout: Duration) -> Result<SocketAddr, ResolutionE
         }
     }
 
-    let daemon = ServiceDaemon::new()
-        .map_err(|e| ResolutionError::Daemon(e.to_string()))?;
+    let daemon = ServiceDaemon::new().map_err(|e| ResolutionError::Daemon(e.to_string()))?;
     let daemon = DaemonGuard(daemon);
     let receiver = daemon
         .0
@@ -124,14 +123,13 @@ pub fn resolve_with_timeout(timeout: Duration) -> Result<SocketAddr, ResolutionE
 
 fn first_ipv4_from_event(event: ServiceEvent) -> Option<SocketAddr> {
     if let ServiceEvent::ServiceResolved(info) = event {
-        for addr in info.get_addresses() {
-            return Some(SocketAddr::V4(SocketAddrV4::new(
-                *addr,
-                info.get_port(),
-            )));
-        }
+        info.get_addresses()
+            .iter()
+            .next()
+            .map(|&addr| SocketAddr::V4(SocketAddrV4::new(addr, info.get_port())))
+    } else {
+        None
     }
-    None
 }
 
 /// RAII advertiser: registers a `_teehee._udp.local.` service when
@@ -158,18 +156,10 @@ impl Advertiser {
     ///
     /// Errors are typed via [`AdvertiseError`] so the caller can
     /// surface a clean CLI error rather than a raw `mdns_sd::Error`.
-    pub fn advertise(
-        port: u16,
-        instance: &str,
-        host: &str,
-    ) -> Result<Self, AdvertiseError> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| AdvertiseError::Daemon(e.to_string()))?;
+    pub fn advertise(port: u16, instance: &str, host: &str) -> Result<Self, AdvertiseError> {
+        let daemon = ServiceDaemon::new().map_err(|e| AdvertiseError::Daemon(e.to_string()))?;
         let mut properties = HashMap::new();
-        properties.insert(
-            TXT_VERSION_KEY.to_string(),
-            TXT_VERSION_VALUE.to_string(),
-        );
+        properties.insert(TXT_VERSION_KEY.to_string(), TXT_VERSION_VALUE.to_string());
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             instance,
@@ -318,12 +308,8 @@ mod tests {
         // address. We're forced to special-case non-`ServiceResolved`
         // events because the resolve event is when mdns-sd has
         // gathered enough info to populate addresses.
-        let addr =
-            first_ipv4_from_event(ServiceEvent::SearchStopped(SERVICE_TYPE.to_string()));
-        assert!(
-            addr.is_none(),
-            "SearchStopped must not return an address"
-        );
+        let addr = first_ipv4_from_event(ServiceEvent::SearchStopped(SERVICE_TYPE.to_string()));
+        assert!(addr.is_none(), "SearchStopped must not return an address");
     }
 
     // ----- network-touching (ignored by default) -----
