@@ -22,10 +22,13 @@
 //!   `capacity_packets` argument, with cross-flag validation
 //!   against `--prebuffer-ms`.
 //! * [`cli`]      — clap-derived CLI types.
+//! * [`discovery`] — slice-12 mDNS auto-discovery (opt-in `--mdns`
+//!   on both sides).
 
 pub mod audio_io;
 pub mod buffer_budget;
 pub mod cli;
+pub mod discovery;
 pub mod format_pipeline;
 pub mod generated;
 pub mod jitter;
