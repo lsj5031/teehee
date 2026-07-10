@@ -212,10 +212,7 @@ mod unit {
 
     #[test]
     fn writes_one_json_object_per_line() {
-        let dir = std::env::temp_dir().join(format!(
-            "teehee_jsonl_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("teehee_jsonl_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.jsonl");

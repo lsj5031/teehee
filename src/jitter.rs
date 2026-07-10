@@ -172,7 +172,12 @@ impl JitterBuffer {
         capacity_packets: usize,
         prebuffer_target_frames: Option<usize>,
     ) -> Self {
-        Self::with_high_water(samples_per_packet, capacity_packets, prebuffer_target_frames, None)
+        Self::with_high_water(
+            samples_per_packet,
+            capacity_packets,
+            prebuffer_target_frames,
+            None,
+        )
     }
 
     /// Like [`Self::new`] but with an explicit high-water trim target

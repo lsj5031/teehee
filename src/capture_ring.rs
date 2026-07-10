@@ -55,12 +55,7 @@ impl CaptureRing {
     ///
     /// Capacity is at least `4 * chunk_samples` so a short chunk-ms never
     /// starves the floor, and at most the ms-derived sample count.
-    pub fn new(
-        buffer_ms: usize,
-        sample_rate: u32,
-        channels: u8,
-        chunk_samples: usize,
-    ) -> Self {
+    pub fn new(buffer_ms: usize, sample_rate: u32, channels: u8, chunk_samples: usize) -> Self {
         assert!(sample_rate > 0);
         assert!(channels > 0);
         assert!(chunk_samples > 0);
@@ -204,7 +199,7 @@ mod unit {
         assert!(cap >= 400);
         r.push(&vec![1.0; cap]);
         assert_eq!(r.len(), cap);
-        r.push(&vec![2.0; 50]);
+        r.push(&[2.0; 50]);
         assert_eq!(r.len(), cap);
         assert!(r.stats().overruns >= 50);
         // Newest samples sit at the tail — pop until empty and require
@@ -212,13 +207,13 @@ mod unit {
         let mut saw_two = false;
         while r.len() >= 50 {
             let c = r.pop_chunk(50).unwrap();
-            if c.iter().any(|&x| x == 2.0) {
+            if c.contains(&2.0) {
                 saw_two = true;
             }
         }
-        if r.len() > 0 {
+        if !r.is_empty() {
             let rest = r.pop_chunk(r.len()).unwrap();
-            if rest.iter().any(|&x| x == 2.0) {
+            if rest.contains(&2.0) {
                 saw_two = true;
             }
         }

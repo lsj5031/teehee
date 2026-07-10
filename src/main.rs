@@ -384,7 +384,10 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 &[
                     ("capture_buffer_ms", JsonVal::from(capture_buffer_ms)),
                     ("capacity_samples", JsonVal::from(ring.capacity_samples())),
-                    ("high_water_samples", JsonVal::from(ring.high_water_samples())),
+                    (
+                        "high_water_samples",
+                        JsonVal::from(ring.high_water_samples()),
+                    ),
                     ("sample_rate", JsonVal::from(sample_rate)),
                     ("channels", JsonVal::from(channels)),
                     ("source", JsonVal::from(capturer_source_label)),
@@ -724,9 +727,12 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         // Only reserve a seed frame when rate conversion is active;
         // passthrough must drain exactly out_frames or the ring
         // slowly empties (systematic underruns over long runs).
-        let seed = if state.pipeline.is_passthrough() { 0 } else { 1 };
-        let in_frames =
-            ((out_frames as u64 * input_rate).div_ceil(output_rate)) as usize + seed;
+        let seed = if state.pipeline.is_passthrough() {
+            0
+        } else {
+            1
+        };
+        let in_frames = ((out_frames as u64 * input_rate).div_ceil(output_rate)) as usize + seed;
         let input_samples = in_frames * input_channels;
         if state.scratch.len() < input_samples {
             // Amortized geometric growth: size doubles until it
