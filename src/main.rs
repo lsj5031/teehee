@@ -38,11 +38,13 @@ use tracing::{info, warn};
 use teehee::audio_io;
 use teehee::audio_io::{AudioCapture, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
+use teehee::capture_ring::CaptureRing;
 use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, ResolvedTarget, SendArgs};
 use teehee::discovery;
 use teehee::format_pipeline::FormatPipeline;
 use teehee::generated::SineSource;
 use teehee::jitter::JitterBuffer;
+use teehee::jsonl_log::{JsonVal, JsonlLogger};
 use teehee::mtu_budget::compute_budget;
 use teehee::network::{Receiver, Sender};
 use teehee::protocol::{DecodeStats, Packet, HEADER_LEN};
@@ -89,7 +91,26 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 .to_string()
         }
     };
+    let jsonl = Arc::new(
+        JsonlLogger::open(args.log_file.as_deref().map(std::path::Path::new))
+            .map_err(|e| anyhow::anyhow!("open --log-file: {e}"))?,
+    );
+    if let Some(p) = jsonl.path() {
+        info!(log_file = %p.display(), "JSONL structured logging enabled");
+    }
     info!(target = %target_str, sample_rate, channels, chunk_ms, mtu = args.mtu, "teehee send connecting");
+    jsonl.emit(
+        "send_start",
+        &[
+            ("target", JsonVal::from(target_str.as_str())),
+            ("sample_rate", JsonVal::from(sample_rate)),
+            ("channels", JsonVal::from(channels)),
+            ("chunk_ms", JsonVal::from(chunk_ms)),
+            ("mtu", JsonVal::from(args.mtu)),
+            ("capture_buffer_ms", JsonVal::from(args.capture_buffer_ms)),
+            ("sine", JsonVal::from(args.sine)),
+        ],
+    );
     let tx = Sender::connect(&target_str)?;
 
     let packets_sent = Arc::new(AtomicU64::new(0));
@@ -102,6 +123,9 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // combination is larger than the envelope, and a `--mtu` bump
     // or `--chunk-ms` lower is warranted.
     let fragmentations = Arc::new(AtomicU64::new(0));
+    // Capture-ring metrics for real-capture path; sine mode leaves
+    // these at zero (no capture ring).
+    let capture_ring_slot: Arc<Mutex<Option<CaptureRing>>> = Arc::new(Mutex::new(None));
 
     if args.sine {
         // --sine mode: encode loop runs on a dedicated thread; budget
@@ -177,12 +201,15 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             }
         });
 
-        if args.stats {
+        if args.stats || jsonl.enabled() {
             spawn_periodic_sender_stats(
                 Arc::clone(&packets_sent),
                 args.mtu,
                 budget.max_payload_bytes,
                 Arc::clone(&fragmentations),
+                Arc::clone(&capture_ring_slot),
+                args.stats,
+                Arc::clone(&jsonl),
             );
         }
         // Block until the worker errors out (in practice: never on a real LAN).
@@ -190,7 +217,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         Ok(())
     } else {
         // Real capture: cpal (default input) or WASAPI loopback fills
-        // a shared ring buffer; we pull chunks off it on the main
+        // a bounded CaptureRing; we pull chunks off it on the main
         // thread and encode. Slice 8 routes the capturer selection
         // through `--capture-source` (`default` → cpal input device,
         // `loopback` → Windows WASAPI render endpoint with
@@ -205,24 +232,34 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // differ. The CLI values are only authoritative in `--sine`
         // mode (above), which has no device.
         //
-        // Ring is allocated empty; the cpal/WASAPI callback grows the
-        // buffer naturally via extend_from_slice. Pre-warming capacity
-        // with `chunk_samples` here would require knowing the
-        // device's actual sample_rate + channels before the capturer
-        // opens — not possible. The first few callbacks reallocate
-        // 1-2 times before stabilizing; perf is fine.
-        let ring: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-        let ring_for_capture = Arc::clone(&ring);
+        // The capture ring is constructed AFTER the capturer opens
+        // (device format known). Until then the callback pushes into
+        // a temporary unbounded staging vec that is drained into the
+        // real ring on first encode-loop iteration — actually we open
+        // capturer first with a placeholder, then replace. Simpler:
+        // open capturer only after we know format requires opening
+        // first... cpal needs callback at open. So: create ring with
+        // CLI-estimated format, then rebuild if device differs; or
+        // create ring after open using a two-phase Arc swap.
+        //
+        // Two-phase: slot starts None; callback no-ops until Some;
+        // after open we install CaptureRing sized to device format.
+        // First few ms of audio may drop — acceptable vs permanent lag.
+        let ring_slot: Arc<Mutex<Option<CaptureRing>>> = Arc::clone(&capture_ring_slot);
+        let capture_buffer_ms = args.capture_buffer_ms;
 
         // Build the capturer per `--capture-source`. Both arms
         // produce a capturer implementing [`AudioCapture`]; storing
         // it in `Box<dyn AudioCapture>` lets `_capturer_keepalive`
         // hold either type without a third-crate Sum-implementing
-        // type. The closure `ring_cb` is consumed by whichever
-        // branch runs — exclusive moves, no cloning required.
+        // type. The closure is consumed by whichever branch runs.
+        let ring_for_capture = Arc::clone(&ring_slot);
         let ring_cb = move |data: &[f32]| {
-            let mut buf = ring_for_capture.lock().unwrap();
-            buf.extend_from_slice(data);
+            if let Ok(mut guard) = ring_for_capture.lock() {
+                if let Some(ring) = guard.as_mut() {
+                    ring.push(data);
+                }
+            }
         };
         let capturer: Box<dyn AudioCapture>;
         let capturer_source_label: &'static str;
@@ -240,37 +277,17 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 capturer = Box::new(cap);
             }
             CaptureSource::Auto => {
-                // `ring_cb` is consumed by `open_default_input`
-                // (cpal moves the closure into the audio-thread
-                // context); the auto helper needs to construct
-                // fresh closures for *each* of its two attempts
-                // (cpal-default and WASAPI-loopback-fallback) so
-                // we bridge into the factory-shape by rebuilding
-                // `ring_cb` with a fresh `Arc` clone each time.
-                //
-                // The state the closures mutate is the same
-                // `Arc<Mutex<Vec<f32>>>` (captured above); every
-                // fresh closure clones the same shared ring, so
-                // both attempts write into the same encode-loop
-                // drain.
-                //
-                // The `ring` binding is already in scope at this
-                // point (the run_send outer `ring: Arc<Mutex<Vec<f32>>>`
-                // captured the original state for the cpal
-                // callback); we just re-bind a fresh clone-witness
-                // thread-closure factory that the auto helper can
-                // invoke twice. Note: this closure-factory shape
-                // avoids the `Arc<dyn FnMut + Send>` dispatch
-                // cost on the audio thread's hot path — every
-                // callback is a static, monomorphized
-                // `move |data| { ... }` body, identical to the
-                // v1 / slice-8 path.
-                let ring_for_factory = Arc::clone(&ring);
+                // Factory rebuilds a monomorphized push closure per
+                // probe attempt; all share the same ring slot.
+                let ring_for_factory = Arc::clone(&ring_slot);
                 let make_cb = move || {
                     let ring_inner = Arc::clone(&ring_for_factory);
                     move |data: &[f32]| {
-                        let mut buf = ring_inner.lock().unwrap();
-                        buf.extend_from_slice(data);
+                        if let Ok(mut guard) = ring_inner.lock() {
+                            if let Some(ring) = guard.as_mut() {
+                                ring.push(data);
+                            }
+                        }
                     }
                 };
                 let (cap, label) = audio_io::open_auto_input(make_cb)?;
@@ -278,6 +295,9 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 capturer = cap;
             }
         }
+        // Keep the capturer (and its audio thread / WASAPI client)
+        // alive for the duration of the encode loop.
+        let _capturer_keepalive = capturer;
         // Slice 3 fix: the CLI bindings `sample_rate`, `channels`,
         // `chunk_frames`, `chunk_samples` are SHADOWED here from the
         // device's actual format. Packet metadata (`Packet::new`'s
@@ -285,7 +305,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // device-actual pair, not the CLI defaults. The `--sine`
         // (dry-run) branch above keeps the CLI bindings because
         // there's no physical device to negotiate with.
-        let dev_cfg = capturer.config();
+        let dev_cfg = _capturer_keepalive.config();
         let sample_rate = dev_cfg.sample_rate;
         let channels = dev_cfg.channels as u8;
         let chunk_frames = (sample_rate as usize) * chunk_ms / 1000;
@@ -350,31 +370,75 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         }
         let max_payload = budget.max_payload_bytes;
 
-        if args.stats {
+        // Install the bounded capture ring now that device format is known.
+        {
+            let ring = CaptureRing::new(capture_buffer_ms, sample_rate, channels, chunk_samples);
+            info!(
+                capture_buffer_ms,
+                capacity_samples = ring.capacity_samples(),
+                high_water_samples = ring.high_water_samples(),
+                "capture ring installed (drop-oldest on overrun; catch-up above high-water)"
+            );
+            jsonl.emit(
+                "capture_ring_ready",
+                &[
+                    ("capture_buffer_ms", JsonVal::from(capture_buffer_ms)),
+                    ("capacity_samples", JsonVal::from(ring.capacity_samples())),
+                    ("high_water_samples", JsonVal::from(ring.high_water_samples())),
+                    ("sample_rate", JsonVal::from(sample_rate)),
+                    ("channels", JsonVal::from(channels)),
+                    ("source", JsonVal::from(capturer_source_label)),
+                ],
+            );
+            *ring_slot.lock().unwrap() = Some(ring);
+        }
+
+        if args.stats || jsonl.enabled() {
             spawn_periodic_sender_stats(
                 Arc::clone(&packets_sent),
                 args.mtu,
                 budget.max_payload_bytes,
                 Arc::clone(&fragmentations),
+                Arc::clone(&ring_slot),
+                args.stats,
+                Arc::clone(&jsonl),
             );
         }
 
         // Encode loop runs on the main thread because cpal's data
         // callback must stay fast and we already drain on the main.
+        // When the capture ring is above high-water (burst / stall
+        // recovery), we skip inter-packet sleep and drain until the
+        // fill drops — preventing permanent lag.
         let ps = Arc::clone(&packets_sent);
         let mut seq: u32 = 0;
         let period = Duration::from_millis(chunk_ms as u64);
         let mut next_tick = Instant::now();
         loop {
-            let chunk = {
-                let mut buf = ring.lock().unwrap();
-                if buf.len() < chunk_samples {
-                    // Not enough captured audio yet; wait briefly and try.
-                    drop(buf);
+            let (chunk, catch_up) = {
+                let mut guard = ring_slot.lock().unwrap();
+                let Some(ring) = guard.as_mut() else {
+                    drop(guard);
                     thread::sleep(Duration::from_millis(2));
                     continue;
+                };
+                match ring.pop_chunk(chunk_samples) {
+                    Some(c) => {
+                        // If another full chunk is already buffered,
+                        // keep sending without sleep (catch-up). This
+                        // is what prevents permanent lag after a stall
+                        // or loopback burst. High-water only drives
+                        // stats; readiness of the next chunk drives
+                        // pacing.
+                        let more_ready = ring.len() >= chunk_samples;
+                        (c, more_ready)
+                    }
+                    None => {
+                        drop(guard);
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
                 }
-                buf.drain(..chunk_samples).collect::<Vec<f32>>()
             };
             let frame_ts = (seq as u64) * chunk_frames as u64;
             let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk);
@@ -390,6 +454,11 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             ps.fetch_add(1, Ordering::Relaxed);
             seq = seq.wrapping_add(1);
 
+            if catch_up {
+                // Drain backlog ASAP; do not sleep.
+                next_tick = Instant::now();
+                continue;
+            }
             next_tick += period;
             let now = Instant::now();
             if next_tick > now {
@@ -401,18 +470,17 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Periodic stats reporter for the sender. Emits a `teehee send stats`
-/// line every second — `packets_sent`, `packets_per_sec`, plus, in
-/// slice 9, the configured `--mtu`, the derived `max_payload_bytes`,
-/// and a cumulative `fragmentations` count of packets that
-/// overshot the envelope (the OS IP-fragmented them transparently,
-/// but a non-zero count surfaces the misconfiguration that caused
-/// it).
+/// Periodic stats reporter for the sender. Emits a tracing `info!`
+/// line when `console` is true, and a JSONL `send_stats` event when
+/// a log file is configured.
 fn spawn_periodic_sender_stats(
     packets_sent: Arc<AtomicU64>,
     mtu_bytes: usize,
     max_payload_bytes: usize,
     fragmentations: Arc<AtomicU64>,
+    capture_ring: Arc<Mutex<Option<CaptureRing>>>,
+    console: bool,
+    jsonl: Arc<JsonlLogger>,
 ) {
     thread::spawn(move || {
         let mut last: u64 = 0;
@@ -428,13 +496,44 @@ fn spawn_periodic_sender_stats(
             } else {
                 0.0
             };
-            info!(
-                packets_sent = n,
-                packets_per_sec = format!("{rate:.1}"),
-                mtu_bytes,
-                max_payload_bytes,
-                fragmentations = frag,
-                "teehee send stats"
+            let ring_stats = capture_ring
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|r| r.stats()));
+            let capture_ring_ms = ring_stats.map(|s| s.depth_ms).unwrap_or(0);
+            let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
+            let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
+            let capture_ring_samples = ring_stats.map(|s| s.samples).unwrap_or(0);
+            if console {
+                info!(
+                    packets_sent = n,
+                    packets_per_sec = format!("{rate:.1}"),
+                    mtu_bytes,
+                    max_payload_bytes,
+                    fragmentations = frag,
+                    capture_ring_ms,
+                    capture_ring_high_water_ms,
+                    capture_overruns,
+                    capture_ring_samples,
+                    "teehee send stats"
+                );
+            }
+            jsonl.emit(
+                "send_stats",
+                &[
+                    ("packets_sent", JsonVal::from(n)),
+                    ("packets_per_sec", JsonVal::from(rate)),
+                    ("mtu_bytes", JsonVal::from(mtu_bytes)),
+                    ("max_payload_bytes", JsonVal::from(max_payload_bytes)),
+                    ("fragmentations", JsonVal::from(frag)),
+                    ("capture_ring_ms", JsonVal::from(capture_ring_ms)),
+                    (
+                        "capture_ring_high_water_ms",
+                        JsonVal::from(capture_ring_high_water_ms),
+                    ),
+                    ("capture_overruns", JsonVal::from(capture_overruns)),
+                    ("capture_ring_samples", JsonVal::from(capture_ring_samples)),
+                ],
             );
             last = n;
             last_at = now;
@@ -481,6 +580,13 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     // misconfigured pair (e.g. a typo in one of the flags) halts
     // the binary, not the audio stream later.
     args.validate().map_err(anyhow::Error::msg)?;
+    let jsonl = Arc::new(
+        JsonlLogger::open(args.log_file.as_deref().map(std::path::Path::new))
+            .map_err(|e| anyhow::anyhow!("open --log-file: {e}"))?,
+    );
+    if let Some(p) = jsonl.path() {
+        info!(log_file = %p.display(), "JSONL structured logging enabled");
+    }
     let addr = ("0.0.0.0", args.port);
     let rx = Receiver::bind(addr)?;
     // Slice 12: advertise only *after* the UDP bind succeeds. Use the
@@ -515,6 +621,15 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         rx_buffer_ms = args.rx_buffer_ms,
         mdns_advertising = args.mdns,
         "teehee recv listening"
+    );
+    jsonl.emit(
+        "recv_start",
+        &[
+            ("port", JsonVal::from(args.port as u64)),
+            ("prebuffer_ms", JsonVal::from(args.prebuffer_ms)),
+            ("rx_buffer_ms", JsonVal::from(args.rx_buffer_ms)),
+            ("mdns", JsonVal::from(args.mdns)),
+        ],
     );
 
     // Slice 6: prebuffer gate target is `--prebuffer-ms` translated
@@ -606,7 +721,12 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         let input_rate = state.input_rate_hz as u64;
         let input_channels = state.input_channels as usize;
         let out_frames = data.len() / output_channels;
-        let in_frames = ((out_frames as u64 * input_rate).div_ceil(output_rate)) as usize + 1;
+        // Only reserve a seed frame when rate conversion is active;
+        // passthrough must drain exactly out_frames or the ring
+        // slowly empties (systematic underruns over long runs).
+        let seed = if state.pipeline.is_passthrough() { 0 } else { 1 };
+        let in_frames =
+            ((out_frames as u64 * input_rate).div_ceil(output_rate)) as usize + seed;
         let input_samples = in_frames * input_channels;
         if state.scratch.len() < input_samples {
             // Amortized geometric growth: size doubles until it
@@ -707,6 +827,20 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         let prebuffer_target_frames =
                             (prebuffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
                                 / 1000;
+                        // High-water for latency trim: 2× prebuffer or
+                        // prebuffer + 100 ms, capped by rx-buffer depth.
+                        let plus_100 = ((prebuffer_ms + 100)
+                            * pkt.sample_rate as usize
+                            * pkt.channels as usize)
+                            / 1000;
+                        let high_water_frames = prebuffer_target_frames
+                            .saturating_mul(2)
+                            .max(plus_100)
+                            .min(
+                                (rx_buffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
+                                    / 1000,
+                            )
+                            .max(prebuffer_target_frames.saturating_add(1));
                         // Slice 10 (Tier 3 #9): explicitly derive
                         // `capacity_packets` from `--rx-buffer-ms`
                         // rather than the slice-6 hardcoded
@@ -743,10 +877,11 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 continue;
                             }
                         };
-                        let jb = JitterBuffer::new(
+                        let jb = JitterBuffer::with_high_water(
                             samples_per_packet,
                             capacity_packets,
-                            Some(prebuffer_target_frames),
+                            Some(prebuffer_target_frames.max(1)),
+                            Some(high_water_frames.max(1)),
                         );
                         let pipeline = FormatPipeline::new(
                             pkt.sample_rate,    // input_rate_hz
@@ -759,6 +894,14 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         let sent_ch = pkt.channels;
                         let recv_rate = cfg.sample_rate;
                         let recv_ch = cfg.channels;
+                        // Ring capacity in ms of audio at the *packet*
+                        // duration implied by samples_per_packet.
+                        let ring_capacity_ms = if pkt.sample_rate > 0 && pkt.channels > 0 {
+                            (capacity_packets as u64 * samples_per_packet as u64 * 1000)
+                                / (pkt.sample_rate as u64 * pkt.channels as u64)
+                        } else {
+                            0
+                        };
                         *state_guard = Some(RxState {
                             jb,
                             pipeline,
@@ -774,12 +917,10 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             samples_per_packet,
                             capacity_packets,
                             prebuffer_target_frames,
+                            high_water_frames,
                             prebuffer_ms,
                             rx_buffer_ms,
-                            ring_floor_ms_at_default_audio = capacity_packets as u64
-                                * pkt.sample_rate as u64
-                                * pkt.channels as u64
-                                / 1000,
+                            ring_capacity_ms,
                             format_conversion_active = fp_active,
                             "first packet received — jitter buffer + format pipeline anchored"
                         );
@@ -802,11 +943,13 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         }
     });
 
-    if args.stats {
+    if args.stats || jsonl.enabled() {
         spawn_periodic_receiver_stats(
             Arc::clone(&rx_state),
             Arc::clone(&decode_stats),
             Arc::clone(&stop_flag),
+            args.stats,
+            Arc::clone(&jsonl),
         );
     }
 
@@ -834,6 +977,8 @@ fn spawn_periodic_receiver_stats(
     rx_state: Arc<Mutex<Option<RxState>>>,
     decode_stats: Arc<Mutex<DecodeStats>>,
     stop_flag: Arc<AtomicBool>,
+    console: bool,
+    jsonl: Arc<JsonlLogger>,
 ) {
     thread::spawn(move || {
         while !stop_flag.load(Ordering::Relaxed) {
@@ -841,6 +986,14 @@ fn spawn_periodic_receiver_stats(
             let guard = rx_state.lock().unwrap();
             if let Some(state) = guard.as_ref() {
                 let jb_stats = state.jb.stats();
+                let queued_frames = state.jb.queued_frames();
+                let rate = state.input_rate_hz as u64;
+                let ch = state.input_channels as u64;
+                let queued_ms = if rate > 0 && ch > 0 {
+                    (queued_frames as u64 * 1000) / (rate * ch)
+                } else {
+                    0
+                };
                 let fp = state.pipeline.stats();
                 let fp_active = !state.pipeline.is_passthrough();
                 let d = decode_stats.lock().unwrap();
@@ -856,52 +1009,77 @@ fn spawn_periodic_receiver_stats(
                 // "format conversion active" to find the line
                 // shape that names both formats.
                 //
-                // Slice 10 (Tier 3 #9) ADDS one field to BOTH line
-                // shapes: `ring_overruns`. Non-zero means the sender
-                // out-paced the receiver long enough that the ring
-                // wrapped and we overwrote an unplayed future packet.
-                // Remediation: `raise --rx-buffer-ms` to grow the
-                // ring's `capacity_packets`, or `lower --chunk-ms`
-                // on the sender to reduce the per-burst pressure.
-                if fp_active {
-                    info!(
-                        decode_errors = d.total(),
-                        decode_truncated = d.truncated,
-                        decode_bad_magic = d.bad_magic,
-                        decode_bad_version = d.bad_version,
-                        decode_bad_format = d.bad_format,
-                        late_drops = jb_stats.late_drops,
-                        duplicates = jb_stats.duplicates,
-                        silence_insertions = jb_stats.silence_insertions,
-                        prebuffer_holds = jb_stats.prebuffer_holds,
-                        ring_overruns = jb_stats.ring_overruns,
-                        sender_restarts = jb_stats.sender_restarts,
-                        sender_sample_rate = state.input_rate_hz,
-                        sender_channels = state.input_channels,
-                        receiver_sample_rate = state.pipeline.resampler().output_rate_hz(),
-                        receiver_channels = state.pipeline.mixer().output_channels(),
-                        fp_in = fp.samples_in,
-                        fp_out = fp.samples_out,
-                        "teehee recv stats (format conversion active)"
-                    );
-                } else {
-                    info!(
-                        decode_errors = d.total(),
-                        decode_truncated = d.truncated,
-                        decode_bad_magic = d.bad_magic,
-                        decode_bad_version = d.bad_version,
-                        decode_bad_format = d.bad_format,
-                        late_drops = jb_stats.late_drops,
-                        duplicates = jb_stats.duplicates,
-                        silence_insertions = jb_stats.silence_insertions,
-                        prebuffer_holds = jb_stats.prebuffer_holds,
-                        ring_overruns = jb_stats.ring_overruns,
-                        sender_restarts = jb_stats.sender_restarts,
-                        sample_rate = state.input_rate_hz,
-                        channels = state.input_channels,
-                        "teehee recv stats"
-                    );
+                // Lag diagnostics: `queued_ms` is the live playout
+                // delay estimate; `latency_trims` counts packets
+                // skipped to pull fill back under the high-water mark.
+                if console {
+                    if fp_active {
+                        info!(
+                            decode_errors = d.total(),
+                            decode_truncated = d.truncated,
+                            decode_bad_magic = d.bad_magic,
+                            decode_bad_version = d.bad_version,
+                            decode_bad_format = d.bad_format,
+                            late_drops = jb_stats.late_drops,
+                            duplicates = jb_stats.duplicates,
+                            silence_insertions = jb_stats.silence_insertions,
+                            prebuffer_holds = jb_stats.prebuffer_holds,
+                            ring_overruns = jb_stats.ring_overruns,
+                            sender_restarts = jb_stats.sender_restarts,
+                            latency_trims = jb_stats.latency_trims,
+                            queued_frames,
+                            queued_ms,
+                            sender_sample_rate = state.input_rate_hz,
+                            sender_channels = state.input_channels,
+                            receiver_sample_rate = state.pipeline.resampler().output_rate_hz(),
+                            receiver_channels = state.pipeline.mixer().output_channels(),
+                            fp_in = fp.samples_in,
+                            fp_out = fp.samples_out,
+                            "teehee recv stats (format conversion active)"
+                        );
+                    } else {
+                        info!(
+                            decode_errors = d.total(),
+                            decode_truncated = d.truncated,
+                            decode_bad_magic = d.bad_magic,
+                            decode_bad_version = d.bad_version,
+                            decode_bad_format = d.bad_format,
+                            late_drops = jb_stats.late_drops,
+                            duplicates = jb_stats.duplicates,
+                            silence_insertions = jb_stats.silence_insertions,
+                            prebuffer_holds = jb_stats.prebuffer_holds,
+                            ring_overruns = jb_stats.ring_overruns,
+                            sender_restarts = jb_stats.sender_restarts,
+                            latency_trims = jb_stats.latency_trims,
+                            queued_frames,
+                            queued_ms,
+                            sample_rate = state.input_rate_hz,
+                            channels = state.input_channels,
+                            "teehee recv stats"
+                        );
+                    }
                 }
+                jsonl.emit(
+                    "recv_stats",
+                    &[
+                        ("decode_errors", JsonVal::from(d.total())),
+                        ("late_drops", JsonVal::from(jb_stats.late_drops)),
+                        ("duplicates", JsonVal::from(jb_stats.duplicates)),
+                        (
+                            "silence_insertions",
+                            JsonVal::from(jb_stats.silence_insertions),
+                        ),
+                        ("prebuffer_holds", JsonVal::from(jb_stats.prebuffer_holds)),
+                        ("ring_overruns", JsonVal::from(jb_stats.ring_overruns)),
+                        ("sender_restarts", JsonVal::from(jb_stats.sender_restarts)),
+                        ("latency_trims", JsonVal::from(jb_stats.latency_trims)),
+                        ("queued_frames", JsonVal::from(queued_frames)),
+                        ("queued_ms", JsonVal::from(queued_ms)),
+                        ("sample_rate", JsonVal::from(state.input_rate_hz)),
+                        ("channels", JsonVal::from(state.input_channels)),
+                        ("format_conversion_active", JsonVal::from(fp_active)),
+                    ],
+                );
             }
         }
     });

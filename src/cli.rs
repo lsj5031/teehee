@@ -167,6 +167,25 @@ pub struct SendArgs {
     #[arg(long)]
     pub stats: bool,
 
+    /// Append structured JSONL logs to this path (one JSON object per
+    /// line). When set, periodic stats and lifecycle events are
+    /// written even without a console. Suitable for Task Scheduler
+    /// deploys: `teehee send ... --log-file logs/send.jsonl --stats`.
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<String>,
+
+    /// Maximum capture-side PCM buffer depth in milliseconds. Caps
+    /// the sender's encode backlog so a stall or loopback burst
+    /// cannot permanently inflate lag. Excess samples are drop-oldest
+    /// and counted as `capture_overruns` on the stats / JSONL line.
+    /// Default 200 ms. Range [40, 5000].
+    #[arg(
+        long,
+        default_value_t = crate::capture_ring::CAPTURE_BUFFER_DEFAULT_MS,
+        value_parser = parse_capture_buffer_ms
+    )]
+    pub capture_buffer_ms: usize,
+
     /// Capture source. Three values, picked by the operator's
     /// confidence in the host's audio setup:
     ///
@@ -313,6 +332,12 @@ pub struct RecvArgs {
     #[arg(long)]
     pub stats: bool,
 
+    /// Append structured JSONL logs to this path (one JSON object per
+    /// line). Periodic stats include `queued_ms` / `latency_trims`
+    /// so lag is measurable without scraping tracing text.
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<String>,
+
     /// Opt-in mDNS advertisement (slice 12). When set, after the UDP
     /// receiver successfully binds, an mDNS advertiser is started so
     /// `--mdns` senders on the LAN can discover this receiver without
@@ -343,6 +368,22 @@ fn parse_prebuffer_ms(s: &str) -> Result<usize, String> {
 /// Parse `--chunk-ms` with an inclusive 1..=200 range. Note: clap's
 /// default range check happens at parse time and is reported as a
 /// value validation error.
+fn parse_capture_buffer_ms(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if !(crate::capture_ring::CAPTURE_BUFFER_MIN_MS..=crate::capture_ring::CAPTURE_BUFFER_MAX_MS)
+        .contains(&n)
+    {
+        return Err(format!(
+            "capture-buffer-ms must be in {}..={} (got {n})",
+            crate::capture_ring::CAPTURE_BUFFER_MIN_MS,
+            crate::capture_ring::CAPTURE_BUFFER_MAX_MS
+        ));
+    }
+    Ok(n)
+}
+
 fn parse_chunk_ms(s: &str) -> Result<usize, String> {
     let n: usize = s
         .parse()
@@ -635,6 +676,8 @@ mod unit {
             channels: 2,
             sine: false,
             stats: false,
+            log_file: None,
+            capture_buffer_ms: crate::capture_ring::CAPTURE_BUFFER_DEFAULT_MS,
             // Slice 8: existing tests default to default-input path
             // (preserves v1 behavior under the new field).
             capture_source: CaptureSource::Default,
@@ -1470,6 +1513,7 @@ mod unit {
             prebuffer_ms,
             rx_buffer_ms,
             stats: false,
+            log_file: None,
             mdns: false,
         }
     }

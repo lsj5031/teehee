@@ -21,17 +21,23 @@
 //!   `--rx-buffer-ms` value into the `jitter::JitterBuffer`
 //!   `capacity_packets` argument, with cross-flag validation
 //!   against `--prebuffer-ms`.
+//! * [`capture_ring`] — bounded sender capture buffer with catch-up
+//!   signalling (prevents permanent encode backlog / lag).
+//! * [`jsonl_log`] — optional append-only JSONL structured logger
+//!   (`--log-file`) for Task Scheduler / production deploys.
 //! * [`cli`]      — clap-derived CLI types.
 //! * [`discovery`] — slice-12 mDNS auto-discovery (opt-in `--mdns`
 //!   on both sides).
 
 pub mod audio_io;
 pub mod buffer_budget;
+pub mod capture_ring;
 pub mod cli;
 pub mod discovery;
 pub mod format_pipeline;
 pub mod generated;
 pub mod jitter;
+pub mod jsonl_log;
 pub mod loopback;
 pub mod mtu_budget;
 pub mod network;

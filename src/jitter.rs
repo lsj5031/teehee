@@ -117,6 +117,10 @@ pub struct Stats {
     /// anchoring on the new stream. Non-zero means the sender process
     /// was stopped and re-launched (or the network path changed).
     pub sender_restarts: u64,
+    /// Number of whole packets skipped to bring fill back under the
+    /// high-water mark (adaptive latency trim). Non-zero means the
+    /// receiver discarded audio to prevent lag creep past the target.
+    pub latency_trims: u64,
 }
 
 struct Slot {
@@ -147,6 +151,12 @@ pub struct JitterBuffer {
     /// which together with the operator's `--prebuffer-ms` define
     /// the gate target.
     prebuffer_target_frames: Option<usize>,
+    /// When set together with [`Self::prebuffer_target_frames`],
+    /// `pop_frames` trims (skips whole packets) if fill exceeds this
+    /// high-water, down toward the prebuffer target. Prevents lag
+    /// from climbing toward `capacity_packets` under clock skew /
+    /// bursts.
+    high_water_frames: Option<usize>,
     stats: Stats,
 }
 
@@ -162,10 +172,24 @@ impl JitterBuffer {
         capacity_packets: usize,
         prebuffer_target_frames: Option<usize>,
     ) -> Self {
+        Self::with_high_water(samples_per_packet, capacity_packets, prebuffer_target_frames, None)
+    }
+
+    /// Like [`Self::new`] but with an explicit high-water trim target
+    /// (interleaved f32 samples, same units as `queued_frames`).
+    pub fn with_high_water(
+        samples_per_packet: usize,
+        capacity_packets: usize,
+        prebuffer_target_frames: Option<usize>,
+        high_water_frames: Option<usize>,
+    ) -> Self {
         assert!(samples_per_packet > 0, "samples_per_packet must be > 0");
         assert!(capacity_packets > 0, "capacity_packets must be > 0");
         if let Some(t) = prebuffer_target_frames {
             assert!(t > 0, "prebuffer_target_frames must be > 0 when set");
+        }
+        if let Some(h) = high_water_frames {
+            assert!(h > 0, "high_water_frames must be > 0 when set");
         }
         let mut slots = Vec::with_capacity(capacity_packets);
         for _ in 0..capacity_packets {
@@ -183,6 +207,7 @@ impl JitterBuffer {
             head_offset: 0,
             min_pushed: None,
             prebuffer_target_frames,
+            high_water_frames,
             stats: Stats::default(),
         }
     }
@@ -364,6 +389,12 @@ impl JitterBuffer {
             }
         }
 
+        // Latency trim: if fill grew past high-water (clock skew /
+        // sender burst), skip whole packets until we're near the
+        // prebuffer target again. Only after the gate has released
+        // (or no gate) and only when a play head can be established.
+        self.trim_latency_if_needed();
+
         let mut written = 0;
 
         while written < out.len() {
@@ -456,6 +487,49 @@ impl JitterBuffer {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Skip whole packets while `queued_frames` exceeds high-water,
+    /// aiming for the prebuffer target fill. No-op when high-water
+    /// is unset or head cannot be anchored yet.
+    fn trim_latency_if_needed(&mut self) {
+        let (Some(high), Some(target)) = (self.high_water_frames, self.prebuffer_target_frames)
+        else {
+            return;
+        };
+        if high <= target {
+            return;
+        }
+        // Need a head to skip from; anchor if we have packets but
+        // haven't started (gate already passed if we got here with
+        // target met — or gate is None).
+        if self.head.is_none() {
+            if let Some(m) = self.min_pushed {
+                self.head = Some(m);
+                self.head_offset = 0;
+            } else {
+                return;
+            }
+        }
+        while self.queued_frames() > high {
+            let Some(h) = self.head else {
+                break;
+            };
+            // Discard the remainder of the current packet, then any
+            // full packets until under high-water / at target.
+            let idx = (h as usize) % self.capacity_packets;
+            if self.slots[idx].filled && self.slots[idx].seq == h {
+                self.slots[idx].filled = false;
+                self.slots[idx].seq = 0;
+            }
+            self.head = Some(h.wrapping_add(1));
+            self.head_offset = 0;
+            self.stats.latency_trims += 1;
+            // Stop once at or below target so we don't underrun.
+            if self.queued_frames() <= target {
+                break;
+            }
+        }
     }
 }
 
@@ -988,6 +1062,30 @@ mod unit {
             buf.stats().ring_overruns,
             0,
             "refused push must not count as overrun"
+        );
+    }
+
+    #[test]
+    fn latency_trim_skips_packets_when_over_high_water() {
+        // 4 samples/packet, 8-slot ring. Prebuffer target = 8 frames
+        // (2 packets), high-water = 16 frames (4 packets). Fill 6
+        // packets (24 frames) then pop: trim should drop until <=
+        // target, and latency_trims must be non-zero.
+        let mut buf = JitterBuffer::with_high_water(4, 8, Some(8), Some(16));
+        for s in 0..6u32 {
+            tag_packet(&mut buf, s);
+        }
+        assert_eq!(buf.queued_frames(), 24);
+        let mut out = [0.0_f32; 4];
+        buf.pop_frames(&mut out);
+        assert!(
+            buf.stats().latency_trims > 0,
+            "expected latency trims when fill > high-water"
+        );
+        assert!(
+            buf.queued_frames() <= 16,
+            "fill should be at or under high-water after trim; got {}",
+            buf.queued_frames()
         );
     }
 

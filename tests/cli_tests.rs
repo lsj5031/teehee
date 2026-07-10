@@ -68,6 +68,34 @@ fn send_with_explicit_port_sine_and_stats() {
 }
 
 #[test]
+fn send_parses_log_file_and_capture_buffer_ms() {
+    let cli = parse(&[
+        "send",
+        "--host",
+        "10.0.0.5",
+        "--log-file",
+        "logs/send.jsonl",
+        "--capture-buffer-ms",
+        "300",
+    ])
+    .expect("log-file + capture-buffer-ms must parse");
+    let Command::Send(args) = cli.command else {
+        panic!("expected Send");
+    };
+    assert_eq!(args.log_file.as_deref(), Some("logs/send.jsonl"));
+    assert_eq!(args.capture_buffer_ms, 300);
+}
+
+#[test]
+fn recv_parses_log_file() {
+    let cli = parse(&["recv", "--log-file", "logs/recv.jsonl"]).expect("recv --log-file");
+    let Command::Recv(args) = cli.command else {
+        panic!("expected Recv");
+    };
+    assert_eq!(args.log_file.as_deref(), Some("logs/recv.jsonl"));
+}
+
+#[test]
 fn send_without_host_is_rejected() {
     // clap now treats positional HOST as optional (it's Option<String>),
     // so the missing-host error surfaces from validate() rather than at

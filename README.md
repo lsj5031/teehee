@@ -56,12 +56,21 @@ runtime, no Python, no PortAudio, no installer.
 ### On the Mac (or any Linux/macOS receiver)
 
 ```bash
-./teehee recv --port 5000 --prebuffer-ms 200 --rx-buffer-ms 2000 --stats
+./teehee recv --port 5000 --prebuffer-ms 200 --rx-buffer-ms 2000 --stats \
+  --log-file logs/recv.jsonl
 ```
+
+`--log-file` appends **JSONL** (one JSON object per line) with lifecycle
+events and periodic `recv_stats` / `send_stats` records — ideal for Task
+Scheduler deploys where console output is discarded. Example fields:
+`queued_ms` (live playout delay), `latency_trims`, `capture_ring_ms`,
+`capture_overruns`. Use with or without `--stats` (console tracing).
 
 `--prebuffer-ms` (slice 6) is the *gate*: the receiver waits in
 silence until at least this many ms of audio have accumulated in
-the jitter buffer, then playback starts. Lower for lower first-byte
+the jitter buffer, then playback starts. After start, fill above
+roughly `2× prebuffer` is trimmed (packets skipped) so lag cannot
+silently climb toward `--rx-buffer-ms`. Lower for lower first-byte
 latency (cost: more dropouts on shaky networks); raise for flaky
 Wi-Fi.
 
@@ -95,12 +104,21 @@ colliding slot — a much rarer signature).
 ### Windows system-audio loopback sender
 
 ```bash
-.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 20 --capture-source=loopback --stats
+.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 20 \
+  --capture-source=loopback --stats --log-file logs\send.jsonl
 ```
 
 `--chunk-ms` is the encoder packet interval. `20` (= 50 packets/sec) is a
 reasonable starting point; smaller values give lower latency but higher
 packet rate. Default format is 48 kHz stereo f32.
+
+`--capture-buffer-ms` (default `200`) caps the sender’s capture PCM
+ring. If capture briefly outruns encode (loopback burst after idle,
+scheduling stall), the ring **drop-oldest**s and the encode loop
+**catch-up**s (sends without inter-packet sleep until only one chunk
+remains). Watch `capture_ring_ms` / `capture_overruns` on `--stats` or
+in the JSONL log — a permanently high `capture_ring_ms` was the main
+cause of “receiver lag” before this fix.
 
 `--sample-rate` and `--channels` control the format for `--sine` dry-run
 mode only. For real capture (no `--sine`), the cpal / WASAPI device's
