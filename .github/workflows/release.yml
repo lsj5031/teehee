@@ -1,8 +1,8 @@
 # Multi-platform release binaries (Linux, macOS arm64+x86_64, Windows).
 #
 # Triggers:
-#   - version tags vX.Y.Z  → build all targets + draft GitHub Release
-#   - workflow_dispatch    → same builds as artifacts (optional draft release off)
+#   - version tags vX.Y.Z  → build all targets + publish GitHub Release
+#   - workflow_dispatch    → same builds as Actions artifacts only
 #
 # Not run on PR or ordinary branch pushes — that stays in ci.yml (fast/cheap).
 name: Release
@@ -151,10 +151,10 @@ jobs:
       - name: List release assets
         run: ls -la artifacts
 
-      - name: Create draft GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          draft: false
           generate_release_notes: true
           files: |
             artifacts/*
