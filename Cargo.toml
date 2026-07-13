@@ -3,7 +3,7 @@ name = "teehee"
 version = "0.1.0"
 edition = "2021"
 description = "Stream Windows system audio to a Mac over UDP"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 publish = false
 
 [[bin]]
