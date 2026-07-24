@@ -40,6 +40,7 @@ use teehee::audio_io::{AudioCapture, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
 use teehee::capture_ring::CaptureRing;
 use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, ResolvedTarget, SendArgs};
+use teehee::control::{self, ControlState, GainSource};
 use teehee::discovery;
 use teehee::format_pipeline::FormatPipeline;
 use teehee::generated::SineSource;
@@ -127,6 +128,65 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // these at zero (no capture ring).
     let capture_ring_slot: Arc<Mutex<Option<CaptureRing>>> = Arc::new(Mutex::new(None));
 
+    // Runtime control: TCP server on 127.0.0.1 (opt-in via --control-port).
+    // Default is disabled (port 0); pass --control-port 9090 (or any
+    // free port) to enable pause/resume/volume commands from another
+    // terminal. If the port is already in use, exit with an error.
+    let control = ControlState::new();
+    if args.control_port != 0 {
+        control::start_server(args.control_port, control.clone()).map_err(|e| {
+            anyhow::anyhow!(
+                "control server failed to bind on 127.0.0.1:{}: {} \
+                 (is the port in use by another teehee instance?)",
+                args.control_port,
+                e
+            )
+        })?;
+        info!(
+            control_port = args.control_port,
+            "runtime control server listening on 127.0.0.1:{} \
+             (try 'help')",
+            args.control_port
+        );
+    }
+
+    // System volume following: polls Windows master volume every 500 ms
+    // and feeds it into control.gain. On non-Windows platforms, logs a
+    // warning and has no effect.
+    if args.follow_system_volume {
+        // Warn when combined with loopback: WASAPI loopback may already
+        // capture post-volume audio (driver-dependent). If that's the
+        // case on this machine, the gain multiplier double-applies
+        // volume (e.g. 50% system → captured at ~50% → ×0.5 = 25%).
+        // Not harmful, but the user should know why it sounds extra quiet.
+        if args.capture_source == CaptureSource::Loopback {
+            warn!(
+                "--follow-system-volume combined with --capture-source=loopback: \
+                 WASAPI loopback may already capture post-volume audio on this \
+                 system. If streamed audio sounds quieter than expected, try \
+                 disabling --follow-system-volume or switching to \
+                 --capture-source=default."
+            );
+        }
+        // Read system volume SYNCHRONOUSLY before the encode loop
+        // starts so there is no window at gain 1.0 before the
+        // follower thread's first reading (finding 1 fix).
+        match control::read_and_apply_system_volume(&control) {
+            Ok(vol) => {
+                info!(volume = format!("{:.2}", vol), "initial system volume read");
+            }
+            Err(e) => {
+                warn!(
+                    error = e,
+                    "initial system volume read failed; \
+                     will retry in background"
+                );
+            }
+        }
+        // The follower thread continues polling every 500 ms.
+        control::spawn_volume_follower(control.clone());
+    }
+
     if args.sine {
         // --sine mode: encode loop runs on a dedicated thread; budget
         // computation lives on the worker because chunk_frames/cfg
@@ -169,6 +229,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let ps = Arc::clone(&packets_sent);
         let frag = Arc::clone(&fragmentations);
         let max_payload = budget.max_payload_bytes;
+        let ctrl = control.clone();
         // Dry-run: pure SineSource, no audio_io. Sleep chunk_ms between sends.
         let handle = thread::spawn(move || -> anyhow::Result<()> {
             let mut sine = SineSource::new(sample_rate, channels, 440.0);
@@ -177,7 +238,13 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             let mut seq: u32 = 0;
             let mut next_tick = Instant::now();
             loop {
+                // Runtime control: pause/resume/volume.
+                while ctrl.is_paused() {
+                    thread::sleep(Duration::from_millis(250));
+                }
+
                 sine.fill_chunk(&mut chunk_buf);
+                ctrl.apply_gain(&mut chunk_buf);
                 let frame_ts = (seq as u64) * chunk_frames as u64;
                 let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk_buf);
                 let encoded = pkt.encode();
@@ -210,6 +277,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&capture_ring_slot),
                 args.stats,
                 Arc::clone(&jsonl),
+                control.clone(),
             );
         }
         // Block until the worker errors out (in practice: never on a real LAN).
@@ -405,6 +473,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&ring_slot),
                 args.stats,
                 Arc::clone(&jsonl),
+                control.clone(),
             );
         }
 
@@ -418,7 +487,22 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let period = Duration::from_millis(chunk_ms as u64);
         let mut next_tick = Instant::now();
         loop {
-            let (chunk, catch_up) = {
+            // Runtime control: pause/resume/volume.
+            if control.is_paused() {
+                thread::sleep(Duration::from_millis(250));
+                // Clear stale audio from the capture ring while paused
+                // so that on resume only fresh samples are sent — no
+                // replay of pre-pause buffer.
+                {
+                    let mut guard = ring_slot.lock().unwrap();
+                    if let Some(ring) = guard.as_mut() {
+                        ring.clear();
+                    }
+                }
+                next_tick = Instant::now();
+                continue;
+            }
+            let (mut chunk, catch_up) = {
                 let mut guard = ring_slot.lock().unwrap();
                 let Some(ring) = guard.as_mut() else {
                     drop(guard);
@@ -443,6 +527,8 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                     }
                 }
             };
+            // Apply volume gain to the chunk before encoding.
+            control.apply_gain(&mut chunk);
             let frame_ts = (seq as u64) * chunk_frames as u64;
             let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk);
             let encoded = pkt.encode();
@@ -476,6 +562,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
 /// Periodic stats reporter for the sender. Emits a tracing `info!`
 /// line when `console` is true, and a JSONL `send_stats` event when
 /// a log file is configured.
+#[allow(clippy::too_many_arguments)]
 fn spawn_periodic_sender_stats(
     packets_sent: Arc<AtomicU64>,
     mtu_bytes: usize,
@@ -484,6 +571,7 @@ fn spawn_periodic_sender_stats(
     capture_ring: Arc<Mutex<Option<CaptureRing>>>,
     console: bool,
     jsonl: Arc<JsonlLogger>,
+    control: ControlState,
 ) {
     thread::spawn(move || {
         let mut last: u64 = 0;
@@ -507,6 +595,12 @@ fn spawn_periodic_sender_stats(
             let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
             let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
             let capture_ring_samples = ring_stats.map(|s| s.samples).unwrap_or(0);
+            let paused = control.is_paused();
+            let gain = control.gain();
+            let gain_source = match control.gain_source() {
+                GainSource::Manual => "manual",
+                GainSource::System => "system",
+            };
             if console {
                 info!(
                     packets_sent = n,
@@ -518,6 +612,9 @@ fn spawn_periodic_sender_stats(
                     capture_ring_high_water_ms,
                     capture_overruns,
                     capture_ring_samples,
+                    paused,
+                    gain = format!("{:.2}", gain),
+                    gain_source,
                     "teehee send stats"
                 );
             }
@@ -536,6 +633,9 @@ fn spawn_periodic_sender_stats(
                     ),
                     ("capture_overruns", JsonVal::from(capture_overruns)),
                     ("capture_ring_samples", JsonVal::from(capture_ring_samples)),
+                    ("paused", JsonVal::from(paused)),
+                    ("gain", JsonVal::from(gain as f64)),
+                    ("gain_source", JsonVal::from(gain_source)),
                 ],
             );
             last = n;

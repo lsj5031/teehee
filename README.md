@@ -315,6 +315,95 @@ specific IP you want, or stop the unintended receivers before
 launching `--mdns` mode. Receiver identity / pairing / trust
 selection belongs to a later slice.
 
+### Runtime control (sender)
+
+The sender can accept live control commands over a local TCP socket.
+This is **opt-in and disabled by default** — pass `--control-port` to
+enable:
+
+```bash
+.\teehee.exe send --host <mac-ip> --control-port 9090 \
+  --capture-source=loopback --stats
+```
+
+The control server listens on `127.0.0.1` only (localhost) — no auth
+needed. Binding failure is a hard error (the sender exits with a message
+naming the port), so each sender instance gets its own port.
+
+Connect from another terminal to send commands:
+
+**PowerShell (Windows, no extra tools needed):**
+
+```powershell
+function TeeHee-Control {
+    param([string]$Port = "9090", [string]$Command)
+    $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+    $s = $c.GetStream()
+    $w = New-Object System.IO.StreamWriter($s)
+    $w.WriteLine($Command); $w.Flush()
+    $r = New-Object System.IO.StreamReader($s)
+    $r.ReadLine()
+    $c.Close()
+}
+
+# Usage:
+TeeHee-Control -Command "status"
+TeeHee-Control -Command "pause"
+TeeHee-Control -Command "volume 50"
+TeeHee-Control -Command "resume"
+```
+
+Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `pause` / `p` | Pause streaming (capture continues, packets stop) |
+| `resume` / `r` | Resume streaming (capture ring cleared for fresh audio) |
+| `volume <0-100>` | Set volume as percentage (0=silent, 100=unity) |
+| `v <0-100>` | Same as volume |
+| `gain <0.0-10.0>` | Set gain multiplier (0.0=mute, 1.0=unity, 10.0=max) |
+| `g <0.0-10.0>` | Same as gain |
+| `status` / `s` | Show paused state, gain, and source (manual/system) |
+| `help` / `h` / `?` | List available commands |
+
+`volume` and `gain` without a value print the current setting. The
+`status` output includes `source=manual` or `source=system` to indicate
+whether the gain was set by a control command or by the system-volume
+follower.
+
+**Pause/resume semantics:** while paused, the capture ring is
+continuously cleared so that on resume only fresh audio is sent — no
+stale pre-pause samples are replayed. The receiver sees a silence gap
+bridged by its jitter buffer, then fresh audio starts flowing
+immediately.
+
+#### Follow system volume (`--follow-system-volume`, Windows only)
+
+The `--follow-system-volume` flag polls the Windows system master
+volume every 500 ms and applies it as the sender gain. The system
+volume slider directly controls streamed loudness — no manual control
+commands needed:
+
+```bash
+.\teehee.exe send --host <mac-ip> --capture-source=loopback \
+  --follow-system-volume --stats
+```
+
+Key behaviors:
+
+* **Mute-aware.** When Windows is muted, the stream goes silent. Unmute
+  to resume.
+* **Correct endpoint.** Reads from the `eConsole` render endpoint — the
+  same device that WASAPI loopback captures from.
+* **Immediate start.** The initial volume is read synchronously before
+  the first audio packet is sent, so there is no brief burst at full
+  volume on startup.
+* **Status shows source.** The control `status` command shows
+  `source=system` when the follower is active, so you know a manual
+  `volume` command would be overwritten within 500 ms.
+* **Non-Windows.** The flag is accepted but has no effect; a warning is
+  logged at startup.
+
 ### Dry-run / loopback test without hardware
 
 `teehee send --host 127.0.0.1 --sine` generates a 440 Hz tone at the

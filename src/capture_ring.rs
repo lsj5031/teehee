@@ -131,6 +131,12 @@ impl CaptureRing {
         Some(self.samples.drain(..chunk_samples).collect())
     }
 
+    /// Drain all buffered samples. Used on pause/resume so stale
+    /// audio captured during the pause is not replayed.
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
     /// Current sample count.
     pub fn len(&self) -> usize {
         self.samples.len()

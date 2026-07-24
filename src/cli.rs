@@ -240,6 +240,25 @@ pub struct SendArgs {
     /// Range 1..=60000 ms.
     #[arg(long, default_value_t = 3_000, value_parser = parse_mdns_timeout_ms)]
     pub mdns_timeout_ms: u64,
+
+    /// TCP port for the runtime control server (127.0.0.1 only).
+    /// Accepts pause/resume/volume commands from another terminal.
+    /// Disabled by default (0); pass a non-zero port to enable.
+    /// If the port is already in use, teehee exits with an error.
+    #[arg(
+        long,
+        default_value_t = 0,
+        value_parser = parse_control_port
+    )]
+    pub control_port: u16,
+
+    /// Automatically follow the Windows system master volume.
+    /// Polls the default render endpoint every 500 ms and applies
+    /// its level as the sender gain. Respects system mute — when
+    /// Windows is muted the stream is silent. Non-Windows: the flag
+    /// is accepted but has no effect (a warning is logged).
+    #[arg(long, default_value_t = false)]
+    pub follow_system_volume: bool,
 }
 
 /// Capture-source selector for `teehee send`. Slice 8 added the
@@ -440,6 +459,22 @@ fn parse_port(s: &str) -> Result<u16, String> {
         .map_err(|e: std::num::ParseIntError| e.to_string())?;
     if n > u16::MAX as u32 {
         return Err(format!("port must be in 1..={} (got {n})", u16::MAX));
+    }
+    Ok(n as u16)
+}
+
+/// Parse `--control-port` (sender side). Accepts any valid u16 port
+/// number, including 0 (which means "disable the control server").
+/// No additional range constraint beyond u16 validity.
+fn parse_control_port(s: &str) -> Result<u16, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if n > u16::MAX as u32 {
+        return Err(format!(
+            "control-port must be in 0..={} (got {n})",
+            u16::MAX
+        ));
     }
     Ok(n as u16)
 }
@@ -688,6 +723,8 @@ mod unit {
             // Slice 12: mDNS opt-in; existing tests use explicit host.
             mdns: false,
             mdns_timeout_ms: 3_000,
+            control_port: 0,
+            follow_system_volume: false,
         }
     }
 

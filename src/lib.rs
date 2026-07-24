@@ -33,6 +33,7 @@ pub mod audio_io;
 pub mod buffer_budget;
 pub mod capture_ring;
 pub mod cli;
+pub mod control;
 pub mod discovery;
 pub mod format_pipeline;
 pub mod generated;
