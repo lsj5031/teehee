@@ -375,9 +375,9 @@ impl JitterBuffer {
             return 0;
         }
 
-        // Slice 6 prebuffer gate. If a target has been set AND the
-        // queued_frames count is below it, hold silence and DO NOT
-        // anchor head — even if packets are already in the ring.
+        // Slice 6 prebuffer gate. Before playback starts, if a target
+        // has been set and queued_frames is below it, hold silence and
+        // DO NOT anchor head - even if packets are already in the ring.
         // This is what `--prebuffer-ms` buys the operator: the
         // receiver waits until enough audio is buffered, then
         // anchors and starts playing. Anchoring now (before the
@@ -385,7 +385,7 @@ impl JitterBuffer {
         // potentially underruning before the rest of the ring
         // fills.
         if let Some(target) = self.prebuffer_target_frames {
-            if self.queued_frames() < target {
+            if self.head.is_none() && self.queued_frames() < target {
                 self.stats.prebuffer_holds += 1;
                 for s in &mut out[..] {
                     *s = 0.0;
@@ -899,6 +899,31 @@ mod unit {
             "gate did not fire on the call that crossed the target"
         );
         assert_eq!(buf.stats().silence_insertions, 0);
+    }
+
+    #[test]
+    fn prebuffer_gate_does_not_reengage_after_playback_starts() {
+        // Once the initial target is met and head is anchored, falling
+        // below the target is normal steady-state drain. Reapplying the
+        // startup gate here would periodically mute playback until the
+        // full prebuffer accumulated again.
+        let mut buf = gated_buffer(8);
+        tag_packet(&mut buf, 0);
+        tag_packet(&mut buf, 1);
+
+        let mut first = [99.0_f32; 4];
+        buf.pop_frames(&mut first);
+        assert_eq!(first, [0.001, 0.001, 0.001, 0.001]);
+        assert_eq!(buf.queued_frames(), 4, "fill is now below target");
+
+        let mut second = [99.0_f32; 4];
+        buf.pop_frames(&mut second);
+        assert_eq!(
+            second,
+            [1.001, 1.001, 1.001, 1.001],
+            "an anchored stream must keep playing below the startup target"
+        );
+        assert_eq!(buf.stats().prebuffer_holds, 0);
     }
 
     #[test]

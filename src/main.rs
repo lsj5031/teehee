@@ -479,13 +479,12 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
 
         // Encode loop runs on the main thread because cpal's data
         // callback must stay fast and we already drain on the main.
-        // When the capture ring is above high-water (burst / stall
-        // recovery), we skip inter-packet sleep and drain until the
-        // fill drops — preventing permanent lag.
+        // Real capture is already paced by the audio device: drain every
+        // complete chunk as soon as it arrives. Adding `chunk_ms` sleep
+        // here throttles once per capture-callback batch and makes small
+        // chunks fall behind even though their nominal period is correct.
         let ps = Arc::clone(&packets_sent);
         let mut seq: u32 = 0;
-        let period = Duration::from_millis(chunk_ms as u64);
-        let mut next_tick = Instant::now();
         loop {
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
@@ -499,10 +498,9 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                         ring.clear();
                     }
                 }
-                next_tick = Instant::now();
                 continue;
             }
-            let (mut chunk, catch_up) = {
+            let mut chunk = {
                 let mut guard = ring_slot.lock().unwrap();
                 let Some(ring) = guard.as_mut() else {
                     drop(guard);
@@ -510,16 +508,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                     continue;
                 };
                 match ring.pop_chunk(chunk_samples) {
-                    Some(c) => {
-                        // If another full chunk is already buffered,
-                        // keep sending without sleep (catch-up). This
-                        // is what prevents permanent lag after a stall
-                        // or loopback burst. High-water only drives
-                        // stats; readiness of the next chunk drives
-                        // pacing.
-                        let more_ready = ring.len() >= chunk_samples;
-                        (c, more_ready)
-                    }
+                    Some(c) => c,
                     None => {
                         drop(guard);
                         thread::sleep(Duration::from_millis(2));
@@ -542,19 +531,6 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             tx.send(&encoded)?;
             ps.fetch_add(1, Ordering::Relaxed);
             seq = seq.wrapping_add(1);
-
-            if catch_up {
-                // Drain backlog ASAP; do not sleep.
-                next_tick = Instant::now();
-                continue;
-            }
-            next_tick += period;
-            let now = Instant::now();
-            if next_tick > now {
-                thread::sleep(next_tick - now);
-            } else {
-                next_tick = now;
-            }
         }
     }
 }
