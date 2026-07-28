@@ -67,8 +67,67 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// RAII guard for Windows high-resolution timer. Calls
+/// `timeBeginPeriod(1)` on construction (setting the system timer
+/// resolution to ~1 ms) and `timeEndPeriod(1)` on drop. This
+/// improves `thread::sleep` accuracy from the default ~15.6 ms to
+/// ~1 ms, which is critical for the sender's clock-paced encode
+/// loop — without it, the pacing sleep overshoots by up to 15 ms,
+/// causing bursty packet delivery that the receiver's drift tracker
+/// misreads as crystal skew.
+///
+/// On non-Windows platforms, this is a no-op (the struct is empty).
+/// The system-wide timer resolution change is standard practice for
+/// audio applications on Windows; it is released when the guard is
+/// dropped (on `run_send` return).
+struct HighResTimer {
+    #[cfg(target_os = "windows")]
+    _active: bool,
+}
+
+#[cfg(target_os = "windows")]
+mod winmm {
+    extern "system" {
+        pub fn timeBeginPeriod(uPeriod: u32) -> u32;
+        pub fn timeEndPeriod(uPeriod: u32) -> u32;
+    }
+}
+
+impl HighResTimer {
+    fn acquire() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            unsafe {
+                winmm::timeBeginPeriod(1);
+            }
+            tracing::debug!("Windows timer resolution set to 1 ms (timeBeginPeriod)");
+            Self { _active: true }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for HighResTimer {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            unsafe {
+                winmm::timeEndPeriod(1);
+            }
+            tracing::debug!("Windows timer resolution restored (timeEndPeriod)");
+        }
+    }
+}
+
 /// Sender pipeline. Choose capture path based on `args.sine`.
 fn run_send(args: &SendArgs) -> anyhow::Result<()> {
+    // Windows: request 1 ms timer resolution for accurate send
+    // pacing. Dropped (timeEndPeriod) automatically on return.
+    let _timer = HighResTimer::acquire();
+
     // Validate parses positional vs --host and `host:port` ↔ `--port`
     // collisions BEFORE we open any cpal stream or socket; this keeps
     // the user's typo or ambiguity at startup noise level, not a
