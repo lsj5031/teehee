@@ -12,8 +12,8 @@
 //! and derives a rate-correction factor (ppm) that nudges the
 //! [`LinearResampler`]'s step size to keep the buffer at its target
 //! fill. The correction is smooth (no audible wow/flutter at the
-//! chosen gains) and converges within ~1–2 minutes (time constant
-//! ≈ 42 s at kp=0.5, 95 % settled in ≈ 2 min).
+//! chosen gains) and converges within a few minutes (time constant
+//! ≈ 104 s at kp=0.2, 95 % settled in ≈ 5 min).
 //!
 //! ## Algorithm
 //!
@@ -68,12 +68,14 @@ const MIN_SAMPLES: usize = 50;
 
 /// Default proportional gain: ppm correction per *frame* of offset
 /// from the target (after the D1 fix normalises interleaved samples
-/// to audio frames). At kp=0.5 and 48 kHz, a 100-frame overshoot
-/// (~2 ms at stereo) produces 50 ppm correction — well within the
+/// to audio frames). At kp=0.2 and 48 kHz, a 100-frame overshoot
+/// (~2 ms at stereo) produces 20 ppm correction — well within the
 /// ±500 ppm clamp and inaudible. The resulting time constant is
-/// τ ≈ 1 000 000 / (kp × nominal_rate) ≈ 42 s at 48 kHz, giving
-/// 95 % convergence in ≈ 2 min.
-const DEFAULT_KP: f32 = 0.5;
+/// τ ≈ 1 000 000 / (kp × nominal_rate) ≈ 104 s at 48 kHz, giving
+/// 95 % convergence in ≈ 5 min. This is 10× the original 0.02
+/// (which gave τ ≈ 17 min for mono, ≈ 9 min for stereo) while
+/// staying gentle enough to avoid oscillation under OS sleep jitter.
+const DEFAULT_KP: f32 = 0.2;
 
 /// A single measurement point: elapsed time since tracker creation
 /// and the jitter-buffer fill at that instant, in *audio frames*
@@ -369,10 +371,10 @@ mod unit {
         let ppm = t.current_ppm();
         // The slope is ~0 (stable), but the proportional term should
         // produce a positive correction (drain faster to reach target).
-        // With kp=0.5 and 500 frames offset: p_ppm = 0.5 * 500 = 250.
+        // With kp=0.2 and 500 frames offset: p_ppm = 0.2 * 500 = 100.
         assert!(
-            ppm > 100.0,
-            "fill above target should produce strong positive correction, got {ppm} ppm"
+            ppm > 50.0,
+            "fill above target should produce positive correction, got {ppm} ppm"
         );
     }
 

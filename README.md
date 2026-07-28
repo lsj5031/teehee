@@ -606,6 +606,49 @@ resampler reconciles the two. A future version may open the output
 device at the sender's rate when supported (device-rate matching),
 eliminating the resampler overhead entirely.
 
+### Clock-drift compensation (`drift_ppm`, `drift_slope`)
+
+Sender and receiver audio crystals differ by ±50–200 ppm. When
+nominal rates match (both 48 kHz), the resampler is bypassed and
+drift accumulates silently: sender-faster → buffer grows → periodic
+packet-skip clicks; receiver-faster → buffer drains → underrun
+freeze + full prebuffer re-fill (~200 ms silence).
+
+The receiver now tracks the jitter-buffer fill level over an 8-second
+sliding window, computes the fill slope via least-squares linear
+regression, and derives a rate-correction factor (`drift_ppm`) that
+nudges the resampler's step size to keep the buffer at its target
+fill. Two terms contribute:
+
+* **Slope term** — if the buffer is growing at `m` frames/sec, the
+  correction is `(m / nominal_rate) × 1 000 000` ppm. This directly
+  counteracts the crystal skew.
+* **Proportional term** — gently pulls the buffer back toward the
+  prebuffer target. Gain `kp = 0.2` (10× the initial 0.02) gives a
+  time constant of ≈ 104 s at 48 kHz; 95 % settled in ≈ 5 min.
+
+Both terms are normalised to *audio frames* (interleaved samples ÷
+channel count) so the correction is channel-count–agnostic — stereo
+and mono streams produce the same ppm for the same fill drift.
+The total correction is clamped to ±500 ppm (0.05 % step change —
+inaudible per callback).
+
+On `--stats`, watch:
+
+* `drift_ppm` — the applied correction. Near 0 means crystals are
+  matched; ±50–200 is typical LAN drift. ±500 (the clamp) means the
+  tracker is saturating — likely a long pause or burst, not real
+  skew; it will recover.
+* `drift_slope` — the raw fill slope in frames/sec. Positive =
+  buffer growing (sender faster); negative = draining (receiver
+  faster).
+
+After an underrun (`underrun_resyncs` increments), the drift tracker
+resets automatically — the fill cliff and rebuffer ramp would
+otherwise corrupt the regression window. After a latency trim
+(`latency_trims` increments), one drift update is skipped to avoid
+poisoning the slope with the fill discontinuity.
+
 ## Troubleshooting
 
 ### Receiver hears nothing
