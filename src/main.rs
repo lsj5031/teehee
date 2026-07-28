@@ -28,7 +28,7 @@
 //! first packet arrival to lazily initialize both pieces.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,8 @@ use teehee::jitter::JitterBuffer;
 use teehee::jsonl_log::{JsonVal, JsonlLogger};
 use teehee::mtu_budget::compute_budget;
 use teehee::network::{Receiver, Sender};
-use teehee::protocol::{DecodeStats, Packet, HEADER_LEN};
+use teehee::clock_drift::ClockDriftTracker;
+use teehee::protocol::{DecodeStats, Packet, HEADER_LEN, MAX_PAYLOAD_LEN};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -115,6 +116,10 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     let tx = Sender::connect(&target_str)?;
 
     let packets_sent = Arc::new(AtomicU64::new(0));
+    // BUG-5 FIX: send error counter for ICMP port-unreachable /
+    // connection-refused. Both encode loops catch these transient
+    // network errors and continue instead of aborting.
+    let send_errors = Arc::new(AtomicU64::new(0));
     // Slice 9 MTU strategy: per-packet fragmentations counter. The
     // sender does NOT clamp chunk_ms — it always sends the encoded
     // payload, even if the resulting datagram overshoots the link
@@ -226,8 +231,23 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                  a larger value (e.g. 9000 for jumbo)."
             );
         }
+        // FIX-2 (sine mode): validate chunk payload won't exceed
+        // protocol limit. Packet::encode asserts payload ≤ 65535;
+        // catch the violation at startup instead of panicking.
+        if requested_payload_bytes > HEADER_LEN + MAX_PAYLOAD_LEN {
+            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000
+                / sample_rate as usize;
+            anyhow::bail!(
+                "--chunk-ms {chunk_ms} at {sample_rate} Hz × {channels} ch \
+                 produces {requested_payload_bytes} bytes per packet, exceeding \
+                 the protocol limit of {} bytes. Lower --chunk-ms to {max_ms} \
+                 or fewer.",
+                HEADER_LEN + MAX_PAYLOAD_LEN
+            );
+        }
         let ps = Arc::clone(&packets_sent);
         let frag = Arc::clone(&fragmentations);
+        let se = Arc::clone(&send_errors);
         let max_payload = budget.max_payload_bytes;
         let ctrl = control.clone();
         // Dry-run: pure SineSource, no audio_io. Sleep chunk_ms between sends.
@@ -237,6 +257,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             let period = Duration::from_millis(chunk_ms as u64);
             let mut seq: u32 = 0;
             let mut next_tick = Instant::now();
+            let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
             loop {
                 // Runtime control: pause/resume/volume.
                 while ctrl.is_paused() {
@@ -254,8 +275,27 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 if encoded.len() > max_payload {
                     frag.fetch_add(1, Ordering::Relaxed);
                 }
-                tx.send(&encoded)?;
-                ps.fetch_add(1, Ordering::Relaxed);
+                // BUG-5 FIX: survive ICMP port-unreachable / conn-refused.
+                if let Err(e) = tx.send(&encoded) {
+                    use std::io::ErrorKind::*;
+                    match e.kind() {
+                        ConnectionReset | ConnectionRefused => {
+                            se.fetch_add(1, Ordering::Relaxed);
+                            let now = Instant::now();
+                            if now.duration_since(last_send_err_log).as_secs() >= 1 {
+                                tracing::warn!(error = %e, "send error (transient, continuing)");
+                                last_send_err_log = now;
+                            }
+                            // R2 FIX: no `continue` — fall through to the
+                            // pacing sleep below so we always respect
+                            // chunk_ms cadence (prevents busy-spin on
+                            // repeated transient errors).
+                        }
+                        _ => return Err(e.into()),
+                    }
+                } else {
+                    ps.fetch_add(1, Ordering::Relaxed);
+                }
                 seq = seq.wrapping_add(1);
 
                 next_tick += period;
@@ -274,6 +314,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 args.mtu,
                 budget.max_payload_bytes,
                 Arc::clone(&fragmentations),
+                Arc::clone(&send_errors),
                 Arc::clone(&capture_ring_slot),
                 args.stats,
                 Arc::clone(&jsonl),
@@ -470,6 +511,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 args.mtu,
                 budget.max_payload_bytes,
                 Arc::clone(&fragmentations),
+                Arc::clone(&send_errors),
                 Arc::clone(&ring_slot),
                 args.stats,
                 Arc::clone(&jsonl),
@@ -477,60 +519,103 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             );
         }
 
-        // Encode loop runs on the main thread because cpal's data
-        // callback must stay fast and we already drain on the main.
-        // Real capture is already paced by the audio device: drain every
-        // complete chunk as soon as it arrives. Adding `chunk_ms` sleep
-        // here throttles once per capture-callback batch and makes small
-        // chunks fall behind even though their nominal period is correct.
+        // FIX-2: validate chunk payload won't exceed protocol
+        // limit. Packet::encode asserts payload ≤ MAX_PAYLOAD_LEN;
+        // catch the violation at startup instead of panicking
+        // mid-stream. At 48 kHz stereo f32, the limit is ~170 ms;
+        // CLI accepts up to 200 ms, so this check is essential.
+        let max_payload_len = HEADER_LEN + chunk_samples * 4;
+        if max_payload_len > HEADER_LEN + MAX_PAYLOAD_LEN {
+            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000
+                / sample_rate as usize;
+            anyhow::bail!(
+                "--chunk-ms {chunk_ms} at {sample_rate} Hz × {channels} ch \
+                 produces {max_payload_len} bytes per packet, exceeding the \
+                 protocol limit of {} bytes. Lower --chunk-ms to {max_ms} \
+                 or fewer.",
+                HEADER_LEN + MAX_PAYLOAD_LEN
+            );
+        }
+
+        // R1 FIX: pace ALL sends (real audio and silence) at
+        // `chunk_ms` intervals via an absolute clock. The old code
+        // was capture-paced (no sleep on real audio), which caused
+        // the loop to over-drain the ring between capture batches
+        // (~10 ms) and alternate real/silence packets — doubling
+        // stream time and bloating the receiver buffer. Clock
+        // pacing also fixes R2 (error-path busy-spin): every path
+        // through the loop — real, silence, or transient-error —
+        // now hits the same unconditional sleep at the bottom.
         let ps = Arc::clone(&packets_sent);
+        let se = Arc::clone(&send_errors);
         let mut seq: u32 = 0;
+        let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
+        let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_samples);
+        let period = Duration::from_millis(chunk_ms as u64);
+        let mut next_tick = Instant::now();
         loop {
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
                 thread::sleep(Duration::from_millis(250));
-                // Clear stale audio from the capture ring while paused
-                // so that on resume only fresh samples are sent — no
-                // replay of pre-pause buffer.
                 {
                     let mut guard = ring_slot.lock().unwrap();
                     if let Some(ring) = guard.as_mut() {
                         ring.clear();
                     }
                 }
+                // Reset pacing clock so we don't burst-send after
+                // resuming from a long pause.
+                next_tick = Instant::now();
                 continue;
             }
-            let mut chunk = {
+            chunk_buf = {
                 let mut guard = ring_slot.lock().unwrap();
-                let Some(ring) = guard.as_mut() else {
-                    drop(guard);
-                    thread::sleep(Duration::from_millis(2));
-                    continue;
-                };
-                match ring.pop_chunk(chunk_samples) {
-                    Some(c) => c,
-                    None => {
-                        drop(guard);
-                        thread::sleep(Duration::from_millis(2));
-                        continue;
-                    }
+                match guard.as_mut() {
+                    Some(ring) => match ring.pop_chunk(chunk_samples) {
+                        Some(c) => c,
+                        None => vec![0.0f32; chunk_samples],
+                    },
+                    None => vec![0.0f32; chunk_samples],
                 }
             };
-            // Apply volume gain to the chunk before encoding.
-            control.apply_gain(&mut chunk);
+            control.apply_gain(&mut chunk_buf);
             let frame_ts = (seq as u64) * chunk_frames as u64;
-            let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk);
+            let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk_buf);
             let encoded = pkt.encode();
-            // Slice 9: per-packet MTU fragment-on-overrun accounting.
-            // The OS will IP-fragment if encoded.len() exceeds the
-            // envelope; we count the event instead of dropping so the
-            // operator can spot the misconfiguration via --stats.
             if encoded.len() > max_payload {
                 fragmentations.fetch_add(1, Ordering::Relaxed);
             }
-            tx.send(&encoded)?;
-            ps.fetch_add(1, Ordering::Relaxed);
+            // BUG-5 FIX: survive ICMP port-unreachable / conn-refused.
+            if let Err(e) = tx.send(&encoded) {
+                use std::io::ErrorKind::*;
+                match e.kind() {
+                    ConnectionReset | ConnectionRefused => {
+                        se.fetch_add(1, Ordering::Relaxed);
+                        let now = Instant::now();
+                        if now.duration_since(last_send_err_log).as_secs() >= 1 {
+                            tracing::warn!(error = %e, "send error (transient, continuing)");
+                            last_send_err_log = now;
+                        }
+                        // R2 FIX: no `continue` — fall through to
+                        // the pacing sleep below.
+                    }
+                    _ => return Err(e.into()),
+                }
+            } else {
+                ps.fetch_add(1, Ordering::Relaxed);
+            }
             seq = seq.wrapping_add(1);
+
+            // R1 FIX: unconditional pacing at chunk_ms. Every
+            // send (real, silence, or after transient error) hits
+            // this sleep, maintaining a steady packet rate.
+            next_tick += period;
+            let now = Instant::now();
+            if next_tick > now {
+                thread::sleep(next_tick - now);
+            } else {
+                next_tick = now;
+            }
         }
     }
 }
@@ -544,6 +629,7 @@ fn spawn_periodic_sender_stats(
     mtu_bytes: usize,
     max_payload_bytes: usize,
     fragmentations: Arc<AtomicU64>,
+    send_errors: Arc<AtomicU64>,
     capture_ring: Arc<Mutex<Option<CaptureRing>>>,
     console: bool,
     jsonl: Arc<JsonlLogger>,
@@ -557,6 +643,7 @@ fn spawn_periodic_sender_stats(
             let now = Instant::now();
             let n = packets_sent.load(Ordering::Relaxed);
             let frag = fragmentations.load(Ordering::Relaxed);
+            let se = send_errors.load(Ordering::Relaxed);
             let elapsed = now.duration_since(last_at).as_secs_f64();
             let rate = if elapsed > 0.0 {
                 (n - last) as f64 / elapsed
@@ -584,6 +671,7 @@ fn spawn_periodic_sender_stats(
                     mtu_bytes,
                     max_payload_bytes,
                     fragmentations = frag,
+                    send_errors = se,
                     capture_ring_ms,
                     capture_ring_high_water_ms,
                     capture_overruns,
@@ -602,6 +690,7 @@ fn spawn_periodic_sender_stats(
                     ("mtu_bytes", JsonVal::from(mtu_bytes)),
                     ("max_payload_bytes", JsonVal::from(max_payload_bytes)),
                     ("fragmentations", JsonVal::from(frag)),
+                    ("send_errors", JsonVal::from(se)),
                     ("capture_ring_ms", JsonVal::from(capture_ring_ms)),
                     (
                         "capture_ring_high_water_ms",
@@ -632,6 +721,11 @@ struct RxState {
     /// LinearResampler + ChannelMixer composition; sits between
     /// [`JitterBuffer::pop_frames`] and the cpal data callback.
     pipeline: FormatPipeline,
+    /// Clock-drift compensation tracker. Monitors jitter-buffer fill
+    /// over a sliding window and derives a ppm correction that is
+    /// fed to the pipeline's resampler to eliminate periodic glitch
+    /// or re-buffer freeze caused by sender/receiver crystal skew.
+    drift_tracker: ClockDriftTracker,
     /// Sender-side sample rate captured on first packet; used by
     /// the cpal callback to size the scratch buffer.
     input_rate_hz: u32,
@@ -647,6 +741,15 @@ struct RxState {
     /// input-rate). For LAN ratios this is < 4×, so the first
     /// callback reaches steady-state in 1–2 reallocations.
     scratch: Vec<f32>,
+    /// D3 FIX: last-seen `underrun_resyncs` count from the jitter
+    /// buffer. When this changes between callbacks, the drift
+    /// tracker is reset — the fill cliff + rebuffer ramp would
+    /// corrupt the regression window.
+    last_underrun_count: u64,
+    /// D3 FIX: last-seen `latency_trims` count. When this changes,
+    /// the drift-tracker update is skipped for one callback to
+    /// avoid poisoning the slope with the fill discontinuity.
+    last_trim_count: u64,
 }
 
 /// Receiver pipeline. Bounded to a single, default output device for
@@ -737,8 +840,12 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     // independently when initializing the lazy `rx_state` on first
     // packet.
     let rx_state: Arc<Mutex<Option<RxState>>> = Arc::new(Mutex::new(None::<RxState>));
-    let player_cfg_slot: Arc<Mutex<Option<PlayerConfig>>> =
-        Arc::new(Mutex::new(None::<PlayerConfig>));
+    // BUG-3 FIX: replace Arc<Mutex<Option<PlayerConfig>>> with
+    // Arc<OnceLock<PlayerConfig>> for lock-free callback reads.
+    // The old Mutex caused a lock-order inversion against rx_state
+    // in the cpal callback (callback locked player_cfg then
+    // rx_state; recv thread locked rx_state then player_cfg).
+    let player_cfg_slot: Arc<OnceLock<PlayerConfig>> = Arc::new(OnceLock::new());
     // Decode-side stats aggregator (Tier 1 #9 — "Stats gap"). The
     // receiver thread bumps the matching counter on every
     // Packet::decode Err via teehee::protocol::DecodeStats::record.
@@ -761,11 +868,9 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     let player_cfg_slot_for_player = Arc::clone(&player_cfg_slot);
     let rx_state_for_player = Arc::clone(&rx_state);
     let player = audio_io::Player::open_default_output(move |data: &mut [f32]| {
-        let cfg_guard = player_cfg_slot_for_player.lock().unwrap();
-        let cfg = match *cfg_guard {
-            Some(c) => c,
-            // Output format not yet known (sub-microsecond startup
-            // window before main sets the slot). Silence-fill.
+        // BUG-3 FIX: lock-free read via OnceLock (was Mutex).
+        let cfg = match player_cfg_slot_for_player.get() {
+            Some(&c) => c,
             None => {
                 for s in data.iter_mut() {
                     *s = 0.0;
@@ -776,9 +881,6 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         let mut state_guard = rx_state_for_player.lock().unwrap();
         let state = match state_guard.as_mut() {
             Some(s) => s,
-            // Prebuffer gate still held: silence-fill. Identical to
-            // slice-6 behaviour — just gated on rx_state instead of
-            // a bare Option<JitterBuffer>.
             None => {
                 for s in data.iter_mut() {
                     *s = 0.0;
@@ -786,62 +888,73 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                 return;
             }
         };
-        // Scratch sizing: input samples = ceil(out_frames ×
-        // input_rate / output_rate) × input_channels + 1 for the
-        // resampler's seed-frame carry. CRITICAL: do NOT multiply
-        // by channels in the rate ratio — the ratio is FRAME-rate,
-        // not SAMPLE-rate. Mixing channels into the rate computation
-        // (a previous-draft bug) gives incorrect sizes when input
-        // and output channel counts differ (e.g. 48k stereo ->
-        // 48k mono). Frames-only math keeps the time domain
-        // aligned; channels multiply at the end.
-        let output_channels = cfg.channels as usize;
-        let output_rate = cfg.sample_rate as u64;
-        let input_rate = state.input_rate_hz as u64;
-        let input_channels = state.input_channels as usize;
-        let out_frames = data.len() / output_channels;
-        // Only reserve a seed frame when rate conversion is active;
-        // passthrough must drain exactly out_frames or the ring
-        // slowly empties (systematic underruns over long runs).
-        let seed = if state.pipeline.is_passthrough() {
-            0
-        } else {
-            1
-        };
-        let in_frames = ((out_frames as u64 * input_rate).div_ceil(output_rate)) as usize + seed;
-        let input_samples = in_frames * input_channels;
-        if state.scratch.len() < input_samples {
-            // Amortized geometric growth: size doubles until it
-            // covers the new request, plus a small constant for
-            // alignment slack. First resize (cold start) lands at
-            // `max(input_samples, 64)`; subsequent resizes grow by
-            // ~2× each time the cpal callback size creeps up.
-            let next = state.scratch.len().max(64) * 2 + 64;
-            state.scratch.resize(next.max(input_samples), 0.0);
+        let oc = cfg.channels as usize;
+        let out_frames = data.len() / oc;
+
+        // D3 FIX: detect underrun and trim events from the
+        // jitter buffer. On underrun, reset the drift tracker —
+        // the fill cliff + rebuffer ramp would corrupt the
+        // regression window and produce wrong-direction ppm. On
+        // trim, skip one update to avoid poisoning the slope.
+        let jb_stats = state.jb.stats();
+        if jb_stats.underrun_resyncs != state.last_underrun_count {
+            state.drift_tracker.reset();
+            state.last_underrun_count = jb_stats.underrun_resyncs;
         }
-        // Drain the jitter buffer into scratch (input-rate ×
-        // input-channels interleaved f32). `pop_frames` ALWAYS
-        // returns `out.len()` and zero-pads missing queued audio
-        // up to its request size — the pipeline sees a fully
-        // populated `scratch` even when the network has starved.
-        state.jb.pop_frames(&mut state.scratch[..input_samples]);
-        // Convert input-rate × input-channels scratch to
-        // output-rate × output-channels `data`. The pipeline
-        // returns the OUTPUT FRAMES written; linear-resampler
-        // carry state lives inside the pipeline struct (not the
-        // scratch buffer).
-        let written = state
-            .pipeline
-            .process(&state.scratch[..input_samples], data);
-        let written_samples = written * output_channels;
-        // The fixed-point resampler can leave a single output
-        // frame unwritten at the tail of a chunk when carry
-        // state is non-zero and the input ends mid-step. The
-        // next callback fills it in; filling that 1-frame tail
-        // with zeros here is inaudible (likely already silent on
-        // natural-end reach).
-        if written_samples < data.len() {
-            for s in &mut data[written_samples..] {
+        let skip_drift = jb_stats.latency_trims != state.last_trim_count;
+        if skip_drift {
+            state.last_trim_count = jb_stats.latency_trims;
+        }
+        // FIX-3: update clock-drift tracker with current buffer fill
+        // and apply the correction to the resampler. This runs every
+        // cpal callback (~10 ms) and is O(1) except for the sliding-
+        // window regression which uses a small ring buffer.
+        if !skip_drift {
+            let qf = state.jb.queued_frames();
+            state.drift_tracker.update(qf);
+        }
+        // Once the tracker has enough data (~500 ms), apply drift
+        // correction every callback. The resampler runs at nominal
+        // 1:1 ratio with a tiny ppm adjustment to counteract
+        // sender/receiver crystal skew.
+        if state.drift_tracker.is_warmed_up() {
+            let drift_ppm = state.drift_tracker.current_ppm();
+            state.pipeline.set_drift_correction(drift_ppm);
+        }
+
+        // Passthrough fast path: when sender and receiver formats
+        // match AND no drift compensation is active, pop straight
+        // into data (skips two copies). When drift compensation is
+        // active, the resampler runs at a 1.0 nominal ratio with a
+        // small ppm adjustment to counteract crystal skew.
+        if state.pipeline.is_passthrough() {
+            state.jb.pop_frames(data);
+            return;
+        }
+
+        // Non-passthrough: pull input on demand via feed/drain.
+        // drain() first to flush any residual from the previous
+        // callback, then feed() until the output is full.
+        let ir = state.input_rate_hz as u64;
+        let out_rate = cfg.sample_rate as u64;
+        let ic = state.input_channels as usize;
+        let mut w = state.pipeline.drain(data);
+        let mut iters = 0u32;
+        while w < out_frames && iters < 8 {
+            let need = out_frames - w;
+            let in_frames = ((need as u64 * ir).div_ceil(out_rate)).max(1) as usize;
+            let in_samples = in_frames * ic;
+            if state.scratch.len() < in_samples {
+                let next = state.scratch.len().max(64) * 2 + 64;
+                state.scratch.resize(next.max(in_samples), 0.0);
+            }
+            state.jb.pop_frames(&mut state.scratch[..in_samples]);
+            state.pipeline.feed(&state.scratch[..in_samples]);
+            w += state.pipeline.drain(&mut data[w * oc..]);
+            iters += 1;
+        }
+        if w * oc < data.len() {
+            for s in &mut data[w * oc..] {
                 *s = 0.0;
             }
         }
@@ -850,7 +963,8 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     // decoder thread spawns. After this line runs, the first
     // packet handler is GUARANTEED to read `Some(_)` from the
     // slot — no race, no spin-wait, no dropped first packet.
-    *player_cfg_slot.lock().unwrap() = Some(player.config());
+    // BUG-3 FIX: OnceLock::set is lock-free for subsequent reads.
+    let _ = player_cfg_slot.set(player.config());
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let rx_state_for_recv = Arc::clone(&rx_state);
@@ -858,7 +972,14 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
     let ds_for_recv = Arc::clone(&decode_stats);
     let stop_for_recv = Arc::clone(&stop_flag);
     let _rx_handle = thread::spawn(move || {
-        let mut pkt_buf = vec![0u8; 16 * 1024];
+        // FIX-2: size the packet buffer to fit any legal packet.
+        // The old 16 KiB buffer was too small for --chunk-ms > 42
+        // at 48 kHz stereo (packets > 16384 bytes → WSAEMSGSIZE
+        // on Windows recv → total silence). HEADER_LEN +
+        // MAX_PAYLOAD_LEN covers all packets the protocol can
+        // encode (the sender's Packet::encode asserts payload ≤
+        // 65535 bytes).
+        let mut pkt_buf = vec![0u8; HEADER_LEN + MAX_PAYLOAD_LEN];
         let mut sample_buf: Vec<f32> = Vec::new();
         while !stop_for_recv.load(Ordering::Relaxed) {
             match rx.recv_timeout(&mut pkt_buf, Duration::from_millis(100)) {
@@ -881,15 +1002,10 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                     };
                     let mut state_guard = rx_state_for_recv.lock().unwrap();
                     if state_guard.is_none() {
-                        // reader.cfg is guaranteed Some by the
-                        // run_recv ordering invariant (Player is
-                        // opened and cached before this thread
-                        // spawns). If we observably reach this
-                        // unreachable, fix the run_recv ordering.
-                        let cfg = player_cfg_slot_for_recv
-                            .lock()
-                            .unwrap()
-                            .expect("player_cfg_slot must be Some by run_recv contract");
+                        // BUG-3 FIX: lock-free read via OnceLock.
+                        let cfg = *player_cfg_slot_for_recv
+                            .get()
+                            .expect("player_cfg_slot must be set by run_recv contract");
                         let samples_per_packet = pkt.payload.len() / 4; // f32 = 4 bytes
                                                                         // Slice 6 prebuffer gate target — unchanged
                                                                         // after slice 7/10. The gate compares
@@ -915,6 +1031,15 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             * pkt.sample_rate as usize
                             * pkt.channels as usize)
                             / 1000;
+                        // FIX medium: hair-trigger trim guard. When
+                        // --prebuffer-ms ≈ --rx-buffer-ms (e.g. 200/300),
+                        // high_water can collapse to target+1, causing
+                        // continuous packet drops / crackle. Enforce a
+                        // minimum gap of 50 ms so there is headroom
+                        // between the trim threshold and the playback
+                        // target.
+                        let min_gap_frames =
+                            (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
                         let high_water_frames = prebuffer_target_frames
                             .saturating_mul(2)
                             .max(plus_100)
@@ -922,7 +1047,7 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 (rx_buffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
                                     / 1000,
                             )
-                            .max(prebuffer_target_frames.saturating_add(1));
+                            .max(prebuffer_target_frames.saturating_add(min_gap_frames));
                         // Slice 10 (Tier 3 #9): explicitly derive
                         // `capacity_packets` from `--rx-buffer-ms`
                         // rather than the slice-6 hardcoded
@@ -984,12 +1109,20 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         } else {
                             0
                         };
+                        let drift_tracker = ClockDriftTracker::new(
+                            sent_rate,
+                            prebuffer_target_frames.max(1),
+                            sent_ch,
+                        );
                         *state_guard = Some(RxState {
                             jb,
                             pipeline,
+                            drift_tracker,
                             input_rate_hz: sent_rate,
                             input_channels: sent_ch,
                             scratch: Vec::new(),
+                            last_underrun_count: 0,
+                            last_trim_count: 0,
                         });
                         info!(
                             sender_sample_rate = sent_rate,
@@ -1008,12 +1141,106 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         );
                     }
                     pkt.pcm_f32_into(&mut sample_buf);
-                    let state = state_guard
-                        .as_mut()
-                        .expect("rx_state must be Some after first packet");
-                    match state.jb.push(pkt.sequence, &sample_buf) {
-                        teehee::jitter::PushOutcome::Stored => {}
-                        other => warn!(?other, seq = pkt.sequence, "non-Stored push"),
+                    // BUG-4 FIX: rebuild RxState when packet format
+                    // diverges from the anchored values. This handles
+                    // mid-stream sender format changes gracefully
+                    // instead of panicking in copy_from_slice.
+                    {
+                        let state = state_guard
+                            .as_mut()
+                            .expect("rx_state must be Some after first packet");
+                        let spp = pkt.payload.len() / 4;
+                        if pkt.sample_rate != state.input_rate_hz
+                            || pkt.channels != state.input_channels
+                            || spp != state.jb.samples_per_packet()
+                        {
+                            warn!(
+                                old_rate = state.input_rate_hz,
+                                new_rate = pkt.sample_rate,
+                                old_channels = state.input_channels,
+                                new_channels = pkt.channels,
+                                old_spp = state.jb.samples_per_packet(),
+                                new_spp = spp,
+                                "sender format changed — rebuilding jitter buffer + pipeline"
+                            );
+                            let cfg = *player_cfg_slot_for_recv
+                                .get()
+                                .expect("player_cfg_slot must be set");
+                            let prebuffer_target_frames =
+                                (prebuffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
+                                    / 1000;
+                            let plus_100 = ((prebuffer_ms + 100)
+                                * pkt.sample_rate as usize
+                                * pkt.channels as usize)
+                                / 1000;
+                            let min_gap_frames_fmt =
+                                (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
+                            let high_water_frames = prebuffer_target_frames
+                                .saturating_mul(2)
+                                .max(plus_100)
+                                .min(
+                                    (rx_buffer_ms
+                                        * pkt.sample_rate as usize
+                                        * pkt.channels as usize)
+                                        / 1000,
+                                )
+                                .max(prebuffer_target_frames.saturating_add(min_gap_frames_fmt));
+                            let capacity_packets = compute_capacity_packets(
+                                rx_buffer_ms,
+                                prebuffer_ms,
+                                pkt.sample_rate,
+                                pkt.channels,
+                                spp,
+                            )
+                            .unwrap_or(32);
+                            let jb = JitterBuffer::with_high_water(
+                                spp,
+                                capacity_packets,
+                                Some(prebuffer_target_frames.max(1)),
+                                Some(high_water_frames.max(1)),
+                            );
+                            let pipeline = FormatPipeline::new(
+                                pkt.sample_rate,
+                                cfg.sample_rate,
+                                pkt.channels,
+                                cfg.channels as u8,
+                            );
+                            let drift_tracker = ClockDriftTracker::new(
+                                pkt.sample_rate,
+                                prebuffer_target_frames.max(1),
+                                pkt.channels,
+                            );
+                            *state = RxState {
+                                jb,
+                                pipeline,
+                                drift_tracker,
+                                input_rate_hz: pkt.sample_rate,
+                                input_channels: pkt.channels,
+                                scratch: Vec::new(),
+                                last_underrun_count: 0,
+                                last_trim_count: 0,
+                            };
+                        }
+                    }
+                    // BUG-7 FIX: suppress per-packet warns for
+                    // Late/Duplicate (already counted in stats);
+                    // keep warns for MidReadCollision/StreamReset.
+                    let push_result = {
+                        let state = state_guard
+                            .as_mut()
+                            .expect("rx_state must be Some after first packet");
+                        state.jb.push(pkt.sequence, &sample_buf)
+                    };
+                    // Drop state_guard before any warn! to avoid
+                    // holding the rx_state lock during logging.
+                    drop(state_guard);
+                    match push_result {
+                        teehee::jitter::PushOutcome::Stored
+                        | teehee::jitter::PushOutcome::Late
+                        | teehee::jitter::PushOutcome::Duplicate => {}
+                        other => {
+                            warn!(?other, seq = pkt.sequence, "non-Stored push");
+                        }
                     }
                 }
                 Ok(None) => continue,
@@ -1065,104 +1292,141 @@ fn spawn_periodic_receiver_stats(
     thread::spawn(move || {
         while !stop_flag.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_secs(1));
-            let guard = rx_state.lock().unwrap();
-            if let Some(state) = guard.as_ref() {
-                let jb_stats = state.jb.stats();
-                let queued_frames = state.jb.queued_frames();
-                let rate = state.input_rate_hz as u64;
-                let ch = state.input_channels as u64;
-                let queued_ms = if rate > 0 && ch > 0 {
-                    (queued_frames as u64 * 1000) / (rate * ch)
-                } else {
-                    0
-                };
-                let fp = state.pipeline.stats();
-                let fp_active = !state.pipeline.is_passthrough();
-                let d = decode_stats.lock().unwrap();
-                // Per slice-7 design: when sender format == receiver
-                // format the pipeline is a no-op. To preserve
-                // operators' grep muscle memory for the
-                // matching-format case, we emit TWO distinct line
-                // shapes — the original slice-6 line when
-                // passthrough, and an extended line including
-                // sender/receiver sample-rate, channel count, and
-                // format-pipeline sample in/out counts when
-                // conversion is active. Operators grep for
-                // "format conversion active" to find the line
-                // shape that names both formats.
-                //
-                // Lag diagnostics: `queued_ms` is the live playout
-                // delay estimate; `latency_trims` counts packets
-                // skipped to pull fill back under the high-water mark.
-                if console {
-                    if fp_active {
-                        info!(
-                            decode_errors = d.total(),
-                            decode_truncated = d.truncated,
-                            decode_bad_magic = d.bad_magic,
-                            decode_bad_version = d.bad_version,
-                            decode_bad_format = d.bad_format,
-                            late_drops = jb_stats.late_drops,
-                            duplicates = jb_stats.duplicates,
-                            silence_insertions = jb_stats.silence_insertions,
-                            prebuffer_holds = jb_stats.prebuffer_holds,
-                            ring_overruns = jb_stats.ring_overruns,
-                            sender_restarts = jb_stats.sender_restarts,
-                            latency_trims = jb_stats.latency_trims,
-                            queued_frames,
-                            queued_ms,
-                            sender_sample_rate = state.input_rate_hz,
-                            sender_channels = state.input_channels,
-                            receiver_sample_rate = state.pipeline.resampler().output_rate_hz(),
-                            receiver_channels = state.pipeline.mixer().output_channels(),
-                            fp_in = fp.samples_in,
-                            fp_out = fp.samples_out,
-                            "teehee recv stats (format conversion active)"
-                        );
-                    } else {
-                        info!(
-                            decode_errors = d.total(),
-                            decode_truncated = d.truncated,
-                            decode_bad_magic = d.bad_magic,
-                            decode_bad_version = d.bad_version,
-                            decode_bad_format = d.bad_format,
-                            late_drops = jb_stats.late_drops,
-                            duplicates = jb_stats.duplicates,
-                            silence_insertions = jb_stats.silence_insertions,
-                            prebuffer_holds = jb_stats.prebuffer_holds,
-                            ring_overruns = jb_stats.ring_overruns,
-                            sender_restarts = jb_stats.sender_restarts,
-                            latency_trims = jb_stats.latency_trims,
-                            queued_frames,
-                            queued_ms,
-                            sample_rate = state.input_rate_hz,
-                            channels = state.input_channels,
-                            "teehee recv stats"
-                        );
-                    }
-                }
-                jsonl.emit(
-                    "recv_stats",
-                    &[
-                        ("decode_errors", JsonVal::from(d.total())),
-                        ("late_drops", JsonVal::from(jb_stats.late_drops)),
-                        ("duplicates", JsonVal::from(jb_stats.duplicates)),
+            // FIX-1: snapshot all stats under lock, then drop the
+            // guards BEFORE logging / file I/O. The old code held
+            // `rx_state.lock()` across `info!` (console write) and
+            // `jsonl.emit` (file write), which blocked the cpal
+            // audio callback for the duration of I/O — on Windows,
+            // console quick-edit could freeze audio indefinitely.
+            let (
+                jb_stats,
+                queued_frames,
+                queued_ms,
+                fp,
+                fp_active,
+                input_rate_hz,
+                input_channels,
+                recv_rate,
+                recv_ch,
+                drift_ppm,
+                drift_slope,
+            ) = {
+                let guard = rx_state.lock().unwrap();
+                match guard.as_ref() {
+                    Some(state) => {
+                        let jb_stats = state.jb.stats();
+                        let queued_frames = state.jb.queued_frames();
+                        let rate = state.input_rate_hz as u64;
+                        let ch = state.input_channels as u64;
+                        let queued_ms = if rate > 0 && ch > 0 {
+                            (queued_frames as u64 * 1000) / (rate * ch)
+                        } else {
+                            0
+                        };
+                        let fp = state.pipeline.stats();
+                        let fp_active = !state.pipeline.is_passthrough();
+                        let recv_rate = state.pipeline.resampler().output_rate_hz();
+                        let recv_ch = state.pipeline.mixer().output_channels();
+                        let drift_ppm = state.drift_tracker.current_ppm();
+                        let drift_slope = state.drift_tracker.current_slope();
                         (
-                            "silence_insertions",
-                            JsonVal::from(jb_stats.silence_insertions),
-                        ),
-                        ("prebuffer_holds", JsonVal::from(jb_stats.prebuffer_holds)),
-                        ("ring_overruns", JsonVal::from(jb_stats.ring_overruns)),
-                        ("sender_restarts", JsonVal::from(jb_stats.sender_restarts)),
-                        ("latency_trims", JsonVal::from(jb_stats.latency_trims)),
-                        ("queued_frames", JsonVal::from(queued_frames)),
-                        ("queued_ms", JsonVal::from(queued_ms)),
-                        ("sample_rate", JsonVal::from(state.input_rate_hz)),
-                        ("channels", JsonVal::from(state.input_channels)),
-                        ("format_conversion_active", JsonVal::from(fp_active)),
-                    ],
-                );
+                            jb_stats,
+                            queued_frames,
+                            queued_ms,
+                            fp,
+                            fp_active,
+                            state.input_rate_hz,
+                            state.input_channels,
+                            recv_rate,
+                            recv_ch,
+                            drift_ppm,
+                            drift_slope,
+                        )
+                    }
+                    None => continue,
+                }
+            }; // rx_state guard dropped here — audio callback unblocked
+            let d = {
+                let guard = decode_stats.lock().unwrap();
+                *guard
+            }; // decode_stats guard dropped here
+            if console {
+                if fp_active {
+                    info!(
+                        decode_errors = d.total(),
+                        decode_truncated = d.truncated,
+                        decode_bad_magic = d.bad_magic,
+                        decode_bad_version = d.bad_version,
+                        decode_bad_format = d.bad_format,
+                        late_drops = jb_stats.late_drops,
+                        duplicates = jb_stats.duplicates,
+                        silence_insertions = jb_stats.silence_insertions,
+                        prebuffer_holds = jb_stats.prebuffer_holds,
+                        ring_overruns = jb_stats.ring_overruns,
+                        sender_restarts = jb_stats.sender_restarts,
+                        latency_trims = jb_stats.latency_trims,
+                        underrun_resyncs = jb_stats.underrun_resyncs,
+                        queued_frames,
+                        queued_ms,
+                        drift_ppm = format!("{drift_ppm:.1}"),
+                        drift_slope = format!("{drift_slope:.1}"),
+                        sender_sample_rate = input_rate_hz,
+                        sender_channels = input_channels,
+                        receiver_sample_rate = recv_rate,
+                        receiver_channels = recv_ch as u16,
+                        fp_in = fp.samples_in,
+                        fp_out = fp.samples_out,
+                        "teehee recv stats (format conversion active)"
+                    );
+                } else {
+                    info!(
+                        decode_errors = d.total(),
+                        decode_truncated = d.truncated,
+                        decode_bad_magic = d.bad_magic,
+                        decode_bad_version = d.bad_version,
+                        decode_bad_format = d.bad_format,
+                        late_drops = jb_stats.late_drops,
+                        duplicates = jb_stats.duplicates,
+                        silence_insertions = jb_stats.silence_insertions,
+                        prebuffer_holds = jb_stats.prebuffer_holds,
+                        ring_overruns = jb_stats.ring_overruns,
+                        sender_restarts = jb_stats.sender_restarts,
+                        latency_trims = jb_stats.latency_trims,
+                        underrun_resyncs = jb_stats.underrun_resyncs,
+                        queued_frames,
+                        queued_ms,
+                        drift_ppm = format!("{drift_ppm:.1}"),
+                        drift_slope = format!("{drift_slope:.1}"),
+                        sample_rate = input_rate_hz,
+                        channels = input_channels,
+                        "teehee recv stats"
+                    );
+                }
             }
+            jsonl.emit(
+                "recv_stats",
+                &[
+                    ("decode_errors", JsonVal::from(d.total())),
+                    ("late_drops", JsonVal::from(jb_stats.late_drops)),
+                    ("duplicates", JsonVal::from(jb_stats.duplicates)),
+                    (
+                        "silence_insertions",
+                        JsonVal::from(jb_stats.silence_insertions),
+                    ),
+                    ("prebuffer_holds", JsonVal::from(jb_stats.prebuffer_holds)),
+                    ("ring_overruns", JsonVal::from(jb_stats.ring_overruns)),
+                    ("sender_restarts", JsonVal::from(jb_stats.sender_restarts)),
+                    ("latency_trims", JsonVal::from(jb_stats.latency_trims)),
+                    ("underrun_resyncs", JsonVal::from(jb_stats.underrun_resyncs)),
+                    ("queued_frames", JsonVal::from(queued_frames)),
+                    ("queued_ms", JsonVal::from(queued_ms)),
+                    ("drift_ppm", JsonVal::from(drift_ppm as f64)),
+                    ("drift_slope", JsonVal::from(drift_slope as f64)),
+                    ("sample_rate", JsonVal::from(input_rate_hz)),
+                    ("channels", JsonVal::from(input_channels)),
+                    ("format_conversion_active", JsonVal::from(fp_active)),
+                ],
+            );
         }
     });
 }

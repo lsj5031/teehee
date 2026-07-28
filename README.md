@@ -549,6 +549,63 @@ and only tolerable glitches. If the receiver logs show drift
 `--chunk-ms` on the sender (bigger packets, fewer per second, less
 network pressure).
 
+### Low-latency recipe
+
+For LAN setups where you want minimal delay between the sender and
+receiver:
+
+```bash
+# Receiver (Mac / Linux) — low-latency settings
+./teehee recv --port 5000 --prebuffer-ms 40 --rx-buffer-ms 300 --stats
+
+# Sender (Windows) — small chunks for lower per-packet latency
+.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 5 \
+  --capture-source=loopback --stats
+```
+
+`--prebuffer-ms 40` waits only 40 ms before playback starts (vs the
+default 200 ms). `--rx-buffer-ms 300` keeps the ring shallow. The
+sender's `--chunk-ms 5` sends 200 packets/sec with 5 ms of audio per
+packet — the receiver sees each packet almost immediately. The trade-off:
+shaky Wi-Fi will produce more dropouts; raise both values if you hear
+glitches.
+
+### Underrun resync (`underrun_resyncs`)
+
+When the receiver's jitter buffer empties mid-playback (network stall,
+OS scheduling hiccup, or deliberate pause), the play head **freezes**
+instead of advancing through silence indefinitely. The buffer reverts
+to prebuffer mode and re-accumulates audio until the `--prebuffer-ms`
+gate is met again, then resumes playback at the new anchor point. This
+means a brief network gap is bridged automatically — you'll see
+`underrun_resyncs` increment on the `--stats` line, and playback
+continues seamlessly once packets start flowing again. A permanently
+high `underrun_resyncs` count means the network is dropping packets
+frequently; raise `--prebuffer-ms` or move to a wired connection.
+
+### Sender ICMP resilience
+
+The sender now survives transient ICMP port-unreachable or
+connection-refused errors (common when the receiver isn't running yet,
+or during brief network reconfigurations). Instead of crashing, it
+increments the `send_errors` counter on the `--stats` line and
+continues sending. The error is logged at most once per second to
+avoid log spam. Other send errors (e.g. socket closed) still abort.
+
+### Receiver format change handling
+
+If the sender's audio format changes mid-stream (e.g. switching from
+48 kHz stereo to 44.1 kHz mono), the receiver detects the divergence
+and rebuilds its jitter buffer and format pipeline automatically. The
+rebuild is logged once with the old and new values; subsequent packets
+in the new format flow through the new pipeline. No restart needed.
+
+**Note on output device rate.** The receiver opens its output device
+at the OS default rate. If the sender's rate differs, a real-time
+resampler reconciles the two. A future version may open the output
+device at the sender's rate when supported (device-rate matching),
+eliminating the resampler overhead entirely.
+
 ## Troubleshooting
 
 ### Receiver hears nothing

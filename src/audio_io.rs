@@ -750,6 +750,13 @@ impl Player {
             .ok_or_else(|| anyhow::anyhow!("no default output device"))?;
         let config = device.default_output_config()?;
         let sample_format = config.sample_format();
+        // BufferSize::Default lets the OS pick the buffer size
+        // (typically 10–40+ ms). A future --output-buffer-frames CLI
+        // flag could allow operators to opt into BufferSize::Fixed(N)
+        // for lower latency on supported drivers. cpal's Fixed is a
+        // hint on some backends but a hard requirement on others
+        // (WASAPI rejects sizes below the device's minimum period),
+        // so we use Default for safety.
         let stream_config = cpal::StreamConfig {
             channels: config.channels(),
             sample_rate: config.sample_rate(),

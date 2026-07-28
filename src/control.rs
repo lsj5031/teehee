@@ -75,6 +75,9 @@ pub struct ControlState {
     pub gain: Arc<AtomicU32>,
     /// 0 = Manual, 1 = System.
     gain_source: Arc<AtomicU8>,
+    /// Smoothed gain currently being applied. Ramps toward the target
+    /// gain over ~5 ms to avoid audible clicks on volume changes.
+    smoothed_gain: Arc<AtomicU32>,
 }
 
 impl Default for ControlState {
@@ -89,6 +92,7 @@ impl ControlState {
             paused: Arc::new(AtomicBool::new(false)),
             gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
             gain_source: Arc::new(AtomicU8::new(GainSource::Manual as u8)),
+            smoothed_gain: Arc::new(AtomicU32::new(1.0_f32.to_bits())),
         }
     }
 
@@ -119,20 +123,43 @@ impl ControlState {
         self.gain_source.store(source as u8, Ordering::Relaxed);
     }
 
-    /// Apply the current gain multiplier to a sample buffer in place.
-    /// Skips work entirely when gain is 1.0 (unity) so the hot encode
-    /// loop pays one atomic load plus a single f32 compare in the
-    /// steady-state case. `#[inline]` keeps the no-gain path on
-    /// par with hand-rolled `if gain != 1.0` in the call sites.
-    #[inline]
+    /// Apply the current gain multiplier to a sample buffer in place,
+    /// with a smooth ramp from the previous gain to avoid audible
+    /// clicks on volume changes. The ramp spans the entire buffer
+    /// (typically ~5–20 ms of audio per chunk), so each chunk
+    /// transitions linearly from old gain to new gain. After the
+    /// buffer is processed, the smoothed gain converges toward the
+    /// target.
+    ///
+    /// Skips work entirely when both current and target gain are 1.0
+    /// (unity) so the hot encode loop pays minimal overhead in the
+    /// steady-state case.
     pub fn apply_gain(&self, buf: &mut [f32]) {
-        let g = self.gain();
-        if g == 1.0 {
+        let target = self.gain();
+        let current = f32::from_bits(self.smoothed_gain.load(Ordering::Relaxed));
+        // Fast path: both unity — no work needed.
+        if target == 1.0 && current == 1.0 {
             return;
         }
-        for s in buf {
+        // If the buffer is tiny or gains match, just apply constant.
+        if buf.is_empty() {
+            return;
+        }
+        let len = buf.len() as f32;
+        for (i, s) in buf.iter_mut().enumerate() {
+            let t = (i as f32 + 1.0) / len; // 0..1 across the buffer
+            let g = current + (target - current) * t;
             *s *= g;
         }
+        // After the buffer, the smoothed gain has reached the
+        // target. Store it so the next buffer starts from here.
+        self.smoothed_gain.store(target.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read the smoothed gain (test-only).
+    #[cfg(test)]
+    pub fn smoothed_gain_for_test(&self) -> f32 {
+        f32::from_bits(self.smoothed_gain.load(Ordering::Relaxed))
     }
 }
 
@@ -609,15 +636,40 @@ mod unit {
     }
 
     #[test]
-    fn apply_gain_multiplies_samples() {
+    fn apply_gain_ramps_smoothly() {
+        // Gain ramps from smoothed_gain (1.0) to target (0.5)
+        // across the buffer. Formula: g = current + (target - current) * t
+        // where t = (i+1)/len.
         let cs = ControlState::new();
         cs.set_gain_with_source(0.5, GainSource::Manual);
         let mut buf: Vec<f32> = vec![1.0, 2.0, -1.0, 0.0];
         cs.apply_gain(&mut buf);
-        assert!((buf[0] - 0.5).abs() < 1e-6);
-        assert!((buf[1] - 1.0).abs() < 1e-6);
-        assert!((buf[2] - -0.5).abs() < 1e-6);
-        assert!(buf[3].abs() < 1e-6);
+        // i=0: t=0.25, g=1.0+(0.5-1.0)*0.25=0.875, 1.0*0.875=0.875
+        // i=1: t=0.5,  g=0.75, 2.0*0.75=1.5
+        // i=2: t=0.75, g=0.625, -1.0*0.625=-0.625
+        // i=3: t=1.0,  g=0.5 (target reached), 0.0*0.5=0.0
+        assert!((buf[0] - 0.875).abs() < 1e-6, "buf[0] ramped: {}", buf[0]);
+        assert!((buf[1] - 1.5).abs() < 1e-6, "buf[1] ramped: {}", buf[1]);
+        assert!((buf[2] - -0.625).abs() < 1e-6, "buf[2] ramped: {}", buf[2]);
+        assert!(buf[3].abs() < 1e-6, "buf[3] at target: {}", buf[3]);
+        // After apply, smoothed_gain should be at the target.
+        assert!((cs.smoothed_gain_for_test() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn apply_gain_constant_when_already_smoothed() {
+        // After a ramp completes, smoothed_gain == target.
+        // Second call should apply constant gain (no ramp artifacts).
+        let cs = ControlState::new();
+        cs.set_gain_with_source(0.5, GainSource::Manual);
+        cs.apply_gain(&mut vec![1.0; 4]); // ramps from 1.0 → 0.5
+        // Now smoothed_gain is 0.5 and target is 0.5.
+        let mut buf = vec![1.0, 2.0, -1.0, 0.0];
+        cs.apply_gain(&mut buf);
+        assert!((buf[0] - 0.5).abs() < 1e-6, "constant 0.5: {}", buf[0]);
+        assert!((buf[1] - 1.0).abs() < 1e-6, "constant 0.5: {}", buf[1]);
+        assert!((buf[2] - -0.5).abs() < 1e-6, "constant 0.5: {}", buf[2]);
+        assert!(buf[3].abs() < 1e-6, "constant 0.5: {}", buf[3]);
     }
 
     #[test]

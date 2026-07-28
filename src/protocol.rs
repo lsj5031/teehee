@@ -454,4 +454,86 @@ mod unit {
         }
         assert_eq!(s.total(), n_variants);
     }
+
+    // ── FIX-2: payload limit validation ───────────────────────────
+
+    #[test]
+    fn max_payload_len_is_u16_max() {
+        // Pin the constant. The sender's FIX-2 validation compares
+        // against this value; if it drifts, the startup check won't
+        // catch oversized payloads.
+        assert_eq!(MAX_PAYLOAD_LEN, 65_535);
+    }
+
+    #[test]
+    fn header_len_is_25() {
+        // Pin header size so MTU budget math stays correct.
+        assert_eq!(HEADER_LEN, 25);
+    }
+
+    #[test]
+    fn packet_roundtrip_at_large_payload() {
+        // Create a packet with a large payload (just under MAX_PAYLOAD_LEN)
+        // that is a valid multiple of frame size for stereo f32.
+        // stereo f32 frame = 2 * 4 = 8 bytes.
+        // MAX_PAYLOAD_LEN = 65535. Largest multiple of 8 <= 65535 is 65528.
+        let frame_bytes = 8usize; // stereo f32
+        let payload_len = (MAX_PAYLOAD_LEN / frame_bytes) * frame_bytes;
+        assert!(payload_len > 0);
+        assert!(payload_len <= MAX_PAYLOAD_LEN);
+        let num_samples = payload_len / 4; // f32 = 4 bytes
+        let samples: Vec<f32> = vec![0.42; num_samples];
+        let pkt = Packet::new(99, 1234, 48_000, 2, &samples);
+        let encoded = pkt.encode();
+        assert_eq!(encoded.len(), HEADER_LEN + payload_len);
+        // Decode and verify payload survives the roundtrip.
+        let decoded = Packet::decode(&encoded).unwrap();
+        assert_eq!(decoded.sequence, 99);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.payload.len(), payload_len);
+        // Verify a sample survived.
+        let first = decoded.pcm_f32().next().unwrap();
+        assert!((first - 0.42).abs() < 1e-6);
+    }
+
+    #[test]
+    fn payload_len_fits_in_u16_field() {
+        // The wire format stores payload_len as u16 (2 bytes).
+        // MAX_PAYLOAD_LEN = u16::MAX = 65535, so any payload up to
+        // that size fits. Verify the field roundtrips correctly at
+        // the boundary.
+        let payload_len = MAX_PAYLOAD_LEN;
+        // mono f32: each frame is 4 bytes. 65535 is not divisible by 4,
+        // so use 65532 bytes = 16383 samples.
+        let usable = (payload_len / 4) * 4; // 65532
+        let samples: Vec<f32> = vec![1.0; usable / 4];
+        let pkt = Packet::new(0, 0, 44_100, 1, &samples);
+        let encoded = pkt.encode();
+        // payload_len field at offset 23..25 should be 65532.
+        let wire_len = u16::from_le_bytes([encoded[23], encoded[24]]) as usize;
+        assert_eq!(wire_len, usable);
+    }
+
+    #[test]
+    fn max_chunk_ms_at_48k_stereo_matches_main_validation() {
+        // At 48 kHz stereo f32, the maximum --chunk-ms before
+        // exceeding MAX_PAYLOAD_LEN is:
+        //   max_samples = MAX_PAYLOAD_LEN / 4 = 16383
+        //   max_frames = 16383 / 2 = 8191 (round down for stereo)
+        //   max_ms = 8191 * 1000 / 48000 = 170 ms
+        // The FIX-2 validation in main.rs uses the same formula.
+        let max_samples = MAX_PAYLOAD_LEN / 4;
+        let channels = 2usize;
+        let max_frames = max_samples / channels;
+        let max_ms = max_frames * 1000 / 48_000;
+        assert_eq!(max_ms, 170, "max chunk-ms at 48k stereo must be 170");
+        // At 171 ms the payload exceeds the limit.
+        let chunk_frames_171 = 48_000_usize * 171 / 1000;
+        let payload_171 = HEADER_LEN + chunk_frames_171 * channels * 4;
+        assert!(
+            payload_171 > HEADER_LEN + MAX_PAYLOAD_LEN,
+            "171 ms at 48k stereo must exceed protocol limit"
+        );
+    }
 }

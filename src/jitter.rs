@@ -121,6 +121,14 @@ pub struct Stats {
     /// high-water mark (adaptive latency trim). Non-zero means the
     /// receiver discarded audio to prevent lag creep past the target.
     pub latency_trims: u64,
+    /// Number of times the jitter buffer detected an underrun (ring
+    /// empty mid-playback) and froze the play head, reverting to
+    /// prebuffer mode. The receiver re-buffers to `--prebuffer-ms`
+    /// instead of advancing through silence indefinitely. A non-zero
+    /// value on `--stats` means a network starvation or OS scheduling
+    /// stall occurred; playback resumes automatically once enough
+    /// packets arrive.
+    pub underrun_resyncs: u64,
 }
 
 struct Slot {
@@ -157,6 +165,20 @@ pub struct JitterBuffer {
     /// from climbing toward `capacity_packets` under clock skew /
     /// bursts.
     high_water_frames: Option<usize>,
+    /// O(1) fill tracker: number of slots with `filled == true`.
+    /// Maintained by `push` (increment on store into empty slot)
+    /// and `pop_frames` / `trim_latency_if_needed` (decrement on
+    /// slot clear). Used by [`Self::queued_frames`] to avoid an
+    /// O(capacity) scan on every cpal callback.
+    filled_count: usize,
+    /// Floor sequence for post-underrun re-anchor. When
+    /// `pop_frames` detects an underrun (missing head slot with
+    /// empty ring), it freezes the play head and records the
+    /// current `head` seq as `resync_floor`. Subsequent pushes
+    /// while in prebuffer reject seq strictly earlier than this
+    /// floor, so the re-anchor never replays already-played audio.
+    /// Cleared by [`Self::reset_state`].
+    resync_floor: Option<u32>,
     stats: Stats,
 }
 
@@ -213,6 +235,8 @@ impl JitterBuffer {
             min_pushed: None,
             prebuffer_target_frames,
             high_water_frames,
+            filled_count: 0,
+            resync_floor: None,
             stats: Stats::default(),
         }
     }
@@ -223,10 +247,19 @@ impl JitterBuffer {
         self.head = None;
         self.head_offset = 0;
         self.min_pushed = None;
+        self.resync_floor = None;
+        self.filled_count = 0;
         for slot in &mut self.slots {
             slot.filled = false;
             slot.seq = 0;
         }
+    }
+
+    /// Samples per packet (interleaved f32 samples). Exposed for the
+    /// recv-side callback to size scratch buffers without reaching
+    /// into the jitter buffer's internals.
+    pub fn samples_per_packet(&self) -> usize {
+        self.samples_per_packet
     }
 
     /// Insert a packet. Returns the classification for diagnostics.
@@ -241,16 +274,52 @@ impl JitterBuffer {
         );
         let idx = (seq as usize) % self.capacity_packets;
 
+        // Prebuffer resync-floor guard: while in prebuffer
+        // (head.is_none()), reject seq strictly earlier than the
+        // resync_floor so a post-underrun re-anchor never replays
+        // already-played audio. "Strictly earlier" means
+        // `modular_is_earlier_or_equal(seq, floor) && seq != floor`.
+        //
+        // R1 FIX: the resync-floor guard must also detect sender
+        // restarts. When the sender relaunches, seq resets to 0
+        // (or a small value) while resync_floor is still high.
+        // Without this escape, every post-restart packet is
+        // rejected as Late forever. The gap > capacity_packets
+        // check mirrors the sender-restart detection in the
+        // head.is_some() branch below.
+        if self.head.is_none() {
+            if let Some(floor) = self.resync_floor {
+                if modular_is_earlier_or_equal(seq, floor) && seq != floor {
+                    let gap = floor.wrapping_sub(seq);
+                    if gap > self.capacity_packets as u32 {
+                        // Sender restarted — clear resync_floor and
+                        // allow the packet through as a new anchor.
+                        self.resync_floor = None;
+                        self.stats.sender_restarts += 1;
+                        // Fall through — store below.
+                    } else {
+                        self.stats.late_drops += 1;
+                        return PushOutcome::Late;
+                    }
+                }
+            }
+        }
+
         // Late check and sender-restart detection.
+        // BUG-1 FIX: `seq == head` with `head_offset == 0` is no
+        // longer treated as Late. When the ring is empty and the
+        // play head points at a cleared slot, the sender's next
+        // packet legitimately has `seq == head` — rejecting it
+        // would permanently lock the buffer into silence.
         if let Some(head) = self.head {
-            if modular_is_earlier_or_equal(seq, head) {
+            let fwd = head.wrapping_sub(seq);
+            if modular_is_earlier_or_equal(seq, head) && (fwd > 0 || self.head_offset > 0) {
                 // If the gap from seq to head is larger than the
                 // ring capacity, this isn't normal jitter — the
                 // sender likely restarted (seq reset to 1 while
                 // the receiver's play head advanced far ahead).
                 // Reset the buffer and store as the new anchor.
-                let gap = head.wrapping_sub(seq);
-                if gap > self.capacity_packets as u32 {
+                if fwd > self.capacity_packets as u32 {
                     self.reset_state();
                     self.stats.sender_restarts += 1;
                     // Fall through — store the packet below
@@ -325,6 +394,9 @@ impl JitterBuffer {
 
         // Store the packet (safe — already passed Late/MidRead checks
         // and the slot either doesn't match seq, or is empty).
+        if !self.slots[idx].filled {
+            self.filled_count += 1;
+        }
         self.slots[idx].seq = seq;
         self.slots[idx].samples.copy_from_slice(samples);
         self.slots[idx].filled = true;
@@ -431,7 +503,27 @@ impl JitterBuffer {
                 let src_end = src_start + chunk;
                 out[written..target].copy_from_slice(&self.slots[idx].samples[src_start..src_end]);
             } else {
+                // BUG-1 FIX: missing slot + empty ring → freeze.
+                // Instead of advancing the play head through an
+                // infinite void of silence (which makes the sender
+                // permanently "behind" and rejects every future
+                // push as Late), revert to prebuffer mode. The
+                // prebuffer gate re-arms; once enough packets
+                // arrive, playback resumes at the new anchor.
+                if self.filled_count == 0 {
+                    for s in &mut out[written..] {
+                        *s = 0.0;
+                    }
+                    self.head = None;
+                    self.head_offset = 0;
+                    self.min_pushed = None;
+                    self.resync_floor = Some(h);
+                    self.stats.underrun_resyncs += 1;
+                    return out.len();
+                }
                 // Missing packet (late arrival, gap, or initial silence).
+                // Future packets exist in the ring — silence-fill
+                // this chunk and keep advancing.
                 for s in &mut out[written..target] {
                     *s = 0.0;
                 }
@@ -445,6 +537,9 @@ impl JitterBuffer {
                     self.stats.silence_insertions += 1;
                 }
                 // Clear the slot so push can reuse it after the wrap.
+                if self.slots[idx].filled {
+                    self.filled_count -= 1;
+                }
                 self.slots[idx].filled = false;
                 self.slots[idx].seq = 0;
                 self.head = Some(h.wrapping_add(1));
@@ -476,18 +571,17 @@ impl JitterBuffer {
     /// count. For the prebuffer-gate this is monotone (slots fill
     /// once, then stabilize); for stats we measure fill percentage.
     pub fn queued_frames(&self) -> usize {
-        let head_idx = self.head.map(|h| (h as usize) % self.capacity_packets);
-        let mut total = 0usize;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if slot.filled {
-                total += if Some(i) == head_idx {
-                    slot.samples.len().saturating_sub(self.head_offset)
-                } else {
-                    slot.samples.len()
-                };
+        let base = self.filled_count * self.samples_per_packet;
+        if let Some(h) = self.head {
+            let idx = (h as usize) % self.capacity_packets;
+            if self.slots[idx].filled && self.slots[idx].seq == h {
+                base.saturating_sub(self.head_offset)
+            } else {
+                base
             }
+        } else {
+            base
         }
-        total
     }
 
     pub fn stats(&self) -> Stats {
@@ -524,6 +618,7 @@ impl JitterBuffer {
             // full packets until under high-water / at target.
             let idx = (h as usize) % self.capacity_packets;
             if self.slots[idx].filled && self.slots[idx].seq == h {
+                self.filled_count -= 1;
                 self.slots[idx].filled = false;
                 self.slots[idx].seq = 0;
             }
@@ -643,14 +738,14 @@ mod unit {
     // ----- single-packet partial reads across multiple callbacks -----
 
     #[test]
-    fn partial_reads_from_single_packet_continue_across_callbacks() {
-        // Push one packet (seq=0) of 4 samples; pop in 2-frame chunks
-        // four times — the first two pop seq=0 fully (then head
-        // advances to seq=1 and slot[0] is cleared), the next two
-        // pop silence (slot[1] missing). silence_insertions
-        // increments at the *boundary* (head_offset reaches
-        // samples_per_packet), so we must drain the silence packet
-        // fully before the counter moves.
+    fn partial_reads_from_single_packet_then_underrun_freeze() {
+        // Push one packet (seq=0) of 4 samples; pop in 2-frame chunks.
+        // The first two pops drain seq=0 fully (head advances to seq=1,
+        // slot[0] cleared, filled_count drops to 0). The third pop
+        // hits slot[1] which is missing AND the ring is empty →
+        // BUG-1 FIX: underrun freeze (not silence-stuff + advance).
+        // The buffer reverts to prebuffer mode (head = None) and
+        // records resync_floor = 1.
         let mut buf = small_buffer();
         tag_packet(&mut buf, 0);
 
@@ -662,20 +757,26 @@ mod unit {
         buf.pop_frames(&mut b);
         assert_eq!(b, [0.001, 0.001]);
 
-        // Two partial pops into slot[1] (silence) — neither crosses
-        // the samples_per_packet boundary yet, so silence_insertions
-        // remains 0.
+        // Third pop: slot[1] missing, ring empty → underrun freeze.
+        // Silence-fills the remainder and returns to prebuffer.
         let mut c = [99.0_f32; 2];
         buf.pop_frames(&mut c);
-        assert_eq!(c, [0.0, 0.0]);
-        let mut d = [99.0_f32; 2];
-        buf.pop_frames(&mut d);
-        assert_eq!(d, [0.0, 0.0]);
+        assert_eq!(c, [0.0, 0.0], "underrun freeze silence-fills");
+        assert_eq!(
+            buf.stats().underrun_resyncs,
+            1,
+            "one underrun resync recorded"
+        );
         assert_eq!(
             buf.stats().silence_insertions,
-            1,
-            "one packet's worth of silence stuffing"
+            0,
+            "no silence_insertions — we froze, not advanced"
         );
+
+        // Fourth pop: head is None, min_pushed is None → pure silence.
+        let mut d = [99.0_f32; 2];
+        buf.pop_frames(&mut d);
+        assert_eq!(d, [0.0, 0.0], "prebuffer silence after freeze");
     }
 
     // ----- partial read crossing packet boundary -----
@@ -1117,6 +1218,136 @@ mod unit {
             "fill should be at or under high-water after trim; got {}",
             buf.queued_frames()
         );
+    }
+
+    // ----- R1: post-freeze sender restart -----
+
+    #[test]
+    fn sender_restart_after_underrun_freeze_is_accepted() {
+        // Push packets at high seq so all 4 slots match their head
+        // positions and get played. Then request MORE than 16 samples
+        // so the loop continues past the 4th packet boundary and
+        // hits the underrun freeze (empty slot + filled_count=0).
+        let mut buf = JitterBuffer::new(4, 4, None);
+        for s in 100..104u32 {
+            tag_packet(&mut buf, s);
+        }
+        // Pop 20: 16 for the 4 matching packets + 4 for the
+        // underrun silence. The 5th iteration finds head=104,
+        // slot empty, filled_count=0 → freeze. resync_floor=104.
+        let mut out = [0.0_f32; 20];
+        buf.pop_frames(&mut out);
+        assert_eq!(
+            &out[..16],
+            &[
+                100.001, 100.001, 100.001, 100.001, //
+                101.001, 101.001, 101.001, 101.001, //
+                102.001, 102.001, 102.001, 102.001, //
+                103.001, 103.001, 103.001, 103.001, //
+            ],
+            "4 packets play, then underrun silence"
+        );
+        assert_eq!(&out[16..20], &[0.0, 0.0, 0.0, 0.0], "underrun silence");
+        assert_eq!(
+            buf.stats().underrun_resyncs,
+            1,
+            "underrun freeze at head=104"
+        );
+
+        // Sender restarts at seq=0. Gap from 0 to resync_floor=104
+        // is 104 > capacity=4 → sender restart detected.
+        let restart_samples = vec![0.0_f32; 4];
+        let result = buf.push(0, &restart_samples);
+        assert_eq!(
+            result,
+            PushOutcome::Stored,
+            "sender restart after freeze must be accepted"
+        );
+        assert_eq!(
+            buf.stats().sender_restarts,
+            1,
+            "sender_restarts must increment"
+        );
+        // Playback resumes: pop_frames anchors at min_pushed=0,
+        // slot 0 has seq=0 → match → play the restart packet.
+        let mut pop_out = [0.0_f32; 4];
+        buf.pop_frames(&mut pop_out);
+        assert_eq!(pop_out, [0.0, 0.0, 0.0, 0.0], "restart packet plays");
+    }
+
+    // ----- R5: seq == head with head_offset == 0 stores -----
+
+    #[test]
+    fn seq_equals_head_with_zero_offset_stores_not_late() {
+        // Core Bug-1 fix: when head = h, head_offset = 0, and the
+        // slot for h is cleared (just consumed), pushing seq = h
+        // must be Stored, not Late.
+        let mut buf = small_buffer();
+        tag_packet(&mut buf, 0);
+        // Drain seq=0 fully → head advances to 1, slot[0] cleared.
+        let mut out = [0.0_f32; 4];
+        buf.pop_frames(&mut out);
+        assert_eq!(out, [0.001, 0.001, 0.001, 0.001]);
+        // Now head=1, head_offset=0. Push seq=1 — this is the
+        // current head. With the old code this was Late; with the
+        // fix it must be Stored.
+        let samples = vec![9.9_f32; 4];
+        let result = buf.push(1, &samples);
+        assert_eq!(result, PushOutcome::Stored, "seq==head, offset=0 → Stored");
+        // Verify the packet is actually playable.
+        let mut pop_out = [0.0_f32; 4];
+        buf.pop_frames(&mut pop_out);
+        assert_eq!(pop_out, [9.9, 9.9, 9.9, 9.9], "stored packet must play");
+    }
+
+    // ----- R5: idle-gap resume -----
+
+    #[test]
+    fn idle_gap_resume_with_zero_packet_loss() {
+        // Simulate: push exactly 4 packets (fills the 4-slot ring),
+        // drain 3 (heads 0,1,2 play), then drain the last (head 3
+        // plays) → head=4, filled_count=0 → underrun freeze at
+        // resync_floor=4. Then the sender resumes with packets
+        // starting at seq=4 (the resync_floor boundary). Verify
+        // playback continues with zero packet loss.
+        //
+        // CRITICAL: push exactly capacity (0..4), not more. Pushing
+        // 0..5 would overwrite seq=0 (4%4=0) and break the
+        // assertions for out[..4].
+        let mut buf = small_buffer(); // 4 samples/packet, 4 slots
+        for s in 0..4u32 {
+            tag_packet(&mut buf, s);
+        }
+        // Drain 12 samples = 3 packets (seq 0, 1, 2 — all match).
+        let mut out = [0.0_f32; 12];
+        buf.pop_frames(&mut out);
+        assert_eq!(&out[..4], &[0.001, 0.001, 0.001, 0.001], "seq 0 plays");
+        assert_eq!(&out[4..8], &[1.001, 1.001, 1.001, 1.001], "seq 1 plays");
+        assert_eq!(&out[8..12], &[2.001, 2.001, 2.001, 2.001], "seq 2 plays");
+
+        // Drain remaining 4 samples = 1 packet (seq 3 plays),
+        // then head=4, filled_count=0 → underrun freeze.
+        let mut out2 = [0.0_f32; 8];
+        buf.pop_frames(&mut out2);
+        assert_eq!(&out2[..4], &[3.001, 3.001, 3.001, 3.001], "seq 3 plays");
+        // out2[4..8] is silence from the freeze.
+        assert_eq!(buf.stats().underrun_resyncs, 1, "underrun freeze");
+
+        // Sender resumes: push seq=4..=7. seq=4 == resync_floor,
+        // which is accepted (not strictly earlier). seq=4 becomes
+        // the new anchor.
+        for s in 4..8u32 {
+            tag_packet(&mut buf, s);
+        }
+        // Pop should play seq=4 onwards (no loss).
+        let mut out3 = [0.0_f32; 4];
+        buf.pop_frames(&mut out3);
+        assert_eq!(
+            out3,
+            [4.001, 4.001, 4.001, 4.001],
+            "resume must play from the re-anchor point"
+        );
+        assert_eq!(buf.stats().late_drops, 0, "zero packet loss on resume");
     }
 
     #[test]

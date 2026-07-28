@@ -566,43 +566,41 @@ mod wasapi_loopback_source {
                     }
                 }
             }
-            // Stall recovery: if we've had ~15 seconds of
-            // consecutive Ok(None), the render endpoint is
-            // genuinely idle (no audio playing). Give up and
-            // let the worker loop retry in 5ms.
             if frames_avail == 0 {
                 self.idle_retries += 1;
-                if self.idle_retries >= 3000 {
-                    // ~15s at 5ms/retry — engine likely stalled
-                    // (no audio being rendered); reset counter so
-                    // we don't permanently starve if audio resumes
-                }
                 return Ok(None);
             }
-            let bytes_needed = frames_avail * channels * 4;
-            let f32_capacity = self.sample_buf.capacity();
-            if f32_capacity * 4 < bytes_needed {
-                let f32_grow = bytes_needed.div_ceil(4) - f32_capacity;
-                self.sample_buf.reserve(f32_grow);
-            }
+            // BUG-6 FIX: use resize instead of capacity/reserve/
+            // set_len so the slice can never span past the
+            // allocation. resize initializes the memory to 0.0
+            // (safe for WASAPI's read_from_device to overwrite).
+            let sample_count = frames_avail * channels;
+            self.sample_buf.resize(sample_count, 0.0);
+            let bytes_needed = sample_count * 4;
             let read_view: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.sample_buf.as_mut_ptr() as *mut u8,
                     bytes_needed,
                 )
             };
-            let (consumed, _info) = self
+            let (consumed, info) = self
                 .capture_client
                 .read_from_device(read_view)
                 .map_err(|e| anyhow::anyhow!("IAudioCaptureClient::ReadFromDevice: {e}"))?;
             if consumed == 0 {
+                self.sample_buf.clear();
                 return Ok(None);
             }
-            let sample_count = (consumed as usize) * channels;
-            unsafe {
-                self.sample_buf.set_len(sample_count);
+            // R2 FIX: treat BufferInfo's silent flag as "emit zeros
+            // for that frame count". resize(actual_samples, 0.0)
+            // only fills NEW elements — stale bytes from
+            // read_from_device survive. Use truncate + fill instead.
+            let actual_samples = (consumed as usize) * channels;
+            self.sample_buf.truncate(actual_samples);
+            if info.flags.silent {
+                self.sample_buf.fill(0.0);
             }
-            let out = self.sample_buf[..sample_count].to_vec();
+            let out = self.sample_buf.clone();
             self.sample_buf.clear();
             Ok(Some(out))
         }

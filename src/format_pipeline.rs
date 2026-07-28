@@ -19,6 +19,9 @@
 //!   zero-pad up-mix.
 //! * [`FormatPipeline`] — composes resampler then mixer (order is
 //!   fixed; reversing would mangle the mono→stereo + SR-convert case).
+//!   Exposes `feed` / `drain` / `pending_output_frames` for streaming
+//!   use; `process(input, out)` is a convenience wrapper that calls
+//!   `feed` then `drain`.
 //!
 //! ## Quality bar
 //!
@@ -41,51 +44,60 @@
 /// Sample-rate conversion via fixed-point linear interpolation
 /// between adjacent input samples.
 ///
-/// State machine:
-/// * `last_frame` — left anchor of interp per channel.
-/// * `in_idx` — the input frame acting as the current right anchor.
-/// * `pos_q16` — fixed-point position within `[0, 65536)` in the
-///   gap between `last_frame`'s input frame and `input[in_idx]`'s.
-///   `t = pos_q16 as f32 / 65536.0` is the linear-interp weight.
-/// * `step_q16 = input_rate * 65536 / output_rate` — how much the
-///   cursor advances per produced output frame.
+/// State machine (phase-continuous across calls):
+/// * `last_frame` — left anchor of interp per channel. Carried
+///   across `process` calls so chunk boundaries are seamless.
+/// * `pos_q32` — fixed-point position within `[0, 1<<32)` in the
+///   gap between `last_frame`'s input frame and the current right
+///   anchor. `t = pos_q32 as f64 / 4294967296.0` is the
+///   linear-interp weight. Carried across calls — no per-call
+///   reseed.
+/// * `step_q32 = input_rate * (1<<32) / output_rate` — how much
+///   the cursor advances per produced output frame. Q32 kills the
+///   ~165 ppm rate error that Q16 introduced.
+/// * `seeded` — false until the first `process` call, which
+///   consumes `input[0]` as the left anchor. Subsequent calls
+///   start from `in_idx = 0` (the first frame of the new chunk
+///   is the right anchor).
 ///
-/// Per emitted output: emit `last + (input[in_idx] - last) * t`,
-/// then `pos_q16 += step_q16`. While `pos_q16 >= 65536`, we've
-/// crossed ≥ 1 full input frame: commit
-/// `last = input[in_idx]; in_idx += 1`.
-///
-/// First-call seeding: the very first `process` call must consume
-/// `input[0]` as the left anchor AND emit it verbatim (t=0).
-/// Afterward, `in_idx = 1` so `input[1]` is the first right anchor.
+/// New-loop semantics: discharge carry before emitting, consume all
+/// input, stop when the right anchor is exhausted (no `last_frame`
+/// echo). This means each `process` call produces fewer outputs
+/// than the old reseed-per-call loop, but the total over many calls
+/// is exact: `total_out ≈ total_in × output_rate / input_rate`.
 ///
 /// ### Known limitation
 ///
-/// When `input.len()` is exhausted mid-consume and `pos_q16` is still
-/// ≥ 65536 (rare, requires a per-output stepping multiple of >1.088×
-/// on a short input), the residual carry is discarded. The
-/// fractional position resets to 0 on the next call. For LAN ratios
-/// the recovery happens within one full packet (≤ 20 ms) and is
-/// inaudible; for extreme ratios with very short inputs it could
-/// cause a single-frame discontinuity at chunk boundaries. v1
-/// accepts this; v2 may track a `pending_anchor` carry.
+/// When `pos_q32` residual is non-zero at the end of a chunk and
+/// the next chunk's first frame is the right anchor, interpolation
+/// bridges seamlessly. No carry is discarded.
 #[derive(Debug, Clone)]
 pub struct LinearResampler {
     input_rate_hz: u32,
     output_rate_hz: u32,
     input_channels: u8,
-    /// `step_q16 = input_rate_hz * 65536 / output_rate_hz`. Advances
-    /// the in-gap cursor per produced output.
-    step_q16: u32,
-    /// Cursor in fixed-point (65536 == 1 input frame). Always in
-    /// `[0, 65536)` post-call.
-    pos_q16: u32,
-    /// Last input sample, per channel — left anchor of interp.
+    /// Advances the in-gap cursor per produced output frame.
+    /// `1 << 32 == 1 input frame`.
+    nominal_step_q32: u64,
+    /// The actual step used, potentially adjusted by drift
+    /// compensation. Equals `nominal_step_q32` when no drift
+    /// correction is applied.
+    step_q32: u64,
+    /// Cursor in Q32 fixed-point. Always in `[0, 1<<32)` after
+    /// the crossing-commit loop.
+    pos_q32: u64,
+    /// Left anchor of interpolation, per channel. Carried across
+    /// `process` calls for phase continuity.
     last_frame: Vec<f32>,
+    /// False until the first `process` call seeds `last_frame`.
+    seeded: bool,
     /// Total input frames consumed (incl. the seed consume).
     frames_in: u64,
     /// Total output frames emitted.
     frames_out: u64,
+    /// Whether drift compensation has been applied (forces
+    /// non-passthrough even when rates match).
+    drift_active: bool,
 }
 
 impl LinearResampler {
@@ -95,22 +107,49 @@ impl LinearResampler {
     pub fn new(input_rate_hz: u32, output_rate_hz: u32, input_channels: u8) -> Self {
         assert!(input_rate_hz > 0, "input_rate_hz must be > 0");
         assert!(output_rate_hz > 0, "output_rate_hz must be > 0");
-        let step_q16 = (input_rate_hz as u64 * 65536 / output_rate_hz as u64) as u32;
+        let step_q32 = (input_rate_hz as u64).wrapping_mul(1u64 << 32) / output_rate_hz as u64;
         Self {
             input_rate_hz,
             output_rate_hz,
             input_channels,
-            step_q16,
-            pos_q16: 0,
+            nominal_step_q32: step_q32,
+            step_q32,
+            pos_q32: 0,
             last_frame: vec![0.0; input_channels as usize],
+            seeded: false,
             frames_in: 0,
             frames_out: 0,
+            drift_active: false,
         }
     }
 
-    /// True if this resampler is a no-op (input_rate == output_rate).
+    /// True if this resampler is a no-op (input_rate == output_rate
+    /// AND no drift correction is active).
     pub fn is_passthrough(&self) -> bool {
-        self.input_rate_hz == self.output_rate_hz
+        self.input_rate_hz == self.output_rate_hz && !self.drift_active
+    }
+
+    /// Apply a drift correction in parts-per-million. Positive ppm
+    /// speeds up playback (drains buffer faster); negative slows it.
+    /// The adjustment is applied to the resampler's step size:
+    /// `step = nominal_step * (1 + ppm / 1e6)`.
+    ///
+    /// Setting ppm to 0.0 (or calling this with 0.0) reverts to
+    /// nominal stepping but keeps `drift_active = true` so the
+    /// pipeline remains non-passthrough.
+    pub fn set_drift_correction(&mut self, ppm: f32) {
+        self.drift_active = true;
+        let factor = 1.0 + (ppm as f64) / 1_000_000.0;
+        self.step_q32 = (self.nominal_step_q32 as f64 * factor) as u64;
+        // Ensure step is at least 1 to prevent stalling.
+        if self.step_q32 == 0 {
+            self.step_q32 = 1;
+        }
+    }
+
+    /// Whether drift compensation has been activated.
+    pub fn drift_active(&self) -> bool {
+        self.drift_active
     }
 
     /// Input sample rate in Hz.
@@ -140,9 +179,9 @@ impl LinearResampler {
     /// `input_frames × input_channels`) into OUTPUT frames written
     /// into `out` (interleaved f32, length = `out_capacity ×
     /// input_channels`). Returns the number of OUTPUT frames
-    /// produced, capped by `out_capacity`. Caller must size `out`
-    /// large enough; the
-    /// [`FormatPipeline::process`] helper grows its scratch to fit.
+    /// produced, capped by `out_capacity`. State is preserved
+    /// exactly at the end of the input slice to bridge smoothly
+    /// to the next `process` call.
     pub fn process(&mut self, input_frames: &[f32], out: &mut [f32]) -> usize {
         let ch = self.input_channels as usize;
         debug_assert_eq!(
@@ -162,73 +201,55 @@ impl LinearResampler {
             return 0;
         }
 
-        // Expected full output frame count for this ratio
-        // (ceil division). The loop is bounded by both `natural_end`
-        // and `out_cap` so the caller-side buffer can never overflow.
-        let out_samples = in_frames as u64 * self.output_rate_hz as u64;
-        let natural_end = out_samples.div_ceil(self.input_rate_hz as u64) as usize;
+        let mut in_idx: usize = 0;
 
-        // Reseed every call: `input_frames[0]` is the new left
-        // anchor. v1 intentionally does NOT carry `in_idx` or
-        // `pos_q16` across calls — every chunk is treated as a
-        // fresh packet boundary. This is the design choice (per
-        // slice 7 review): brittle residual-carry state machines
-        // are avoided; the JitterBuffer's missing-packet silence
-        // path absorbs the chunk-boundary discontinuity cleanly.
-        self.last_frame.copy_from_slice(&input_frames[..ch]);
-        self.frames_in += 1;
-        self.pos_q16 = 0;
-        let mut in_idx: usize = 1;
+        // First-call seeding: consume input[0] as the left anchor
+        // AND emit it verbatim (t=0). Afterward, in_idx = 1 so
+        // input[1] is the first right anchor.
+        if !self.seeded {
+            self.last_frame.copy_from_slice(&input_frames[..ch]);
+            self.seeded = true;
+            in_idx = 1;
+            self.frames_in += 1;
+        }
 
         let mut written: usize = 0;
-        let end = natural_end.min(out_cap);
-        while written < end {
-            let t = self.pos_q16 as f32 / 65536.0;
 
-            if in_idx >= in_frames {
-                // Right anchor exhausted — echo `last_frame`. The
-                // natural interp window has stepped past the last
-                // input; output equals `last_frame` regardless
-                // of `t` (interp between identical anchors = anchor).
-                for c in 0..ch {
-                    out[written * ch + c] = self.last_frame[c];
-                }
-            } else {
-                // Interpolate between `last_frame` and
-                // `input_frames[in_idx * ch + c ..]`.
-                let right_off = in_idx * ch;
-                for c in 0..ch {
-                    let a = self.last_frame[c];
-                    let b = input_frames[right_off + c];
-                    out[written * ch + c] = a + (b - a) * t;
-                }
+        // Phase 1: Discharge carry from the previous call.
+        // pos_q32 may be >= 1<<32 if the last call ended with a
+        // crossing mid-step. Advance through input to commit the
+        // left anchor.
+        while self.pos_q32 >= (1u64 << 32) && in_idx < in_frames {
+            self.pos_q32 -= 1u64 << 32;
+            let off = in_idx * ch;
+            self.last_frame
+                .copy_from_slice(&input_frames[off..off + ch]);
+            self.frames_in += 1;
+            in_idx += 1;
+        }
+
+        // Phase 2: Emit output frames while a right anchor exists.
+        while written < out_cap && in_idx < in_frames {
+            let t = (self.pos_q32 as f64 / 4294967296.0) as f32;
+            let right_off = in_idx * ch;
+            for c in 0..ch {
+                let a = self.last_frame[c];
+                let b = input_frames[right_off + c];
+                out[written * ch + c] = a + (b - a) * t;
             }
             written += 1;
             self.frames_out += 1;
 
-            // Advance cursor and commit each cross as a new left
-            // anchor. CRITICAL: commit `input_frames[in_idx]`
-            // BEFORE bumping `in_idx` so no input frame is skipped
-            // (the previous rewrites' bug was `last =
-            // input[in_idx + 1]; in_idx += 1`, which dropped every
-            // other right anchor).
-            let mut carry = self.pos_q16 as u64 + self.step_q16 as u64;
-            while carry >= 65536 && in_idx < in_frames {
-                carry -= 65536;
+            // Advance cursor and commit each crossing as a new left
+            // anchor.
+            self.pos_q32 += self.step_q32;
+            while self.pos_q32 >= (1u64 << 32) && in_idx < in_frames {
+                self.pos_q32 -= 1u64 << 32;
                 let off = in_idx * ch;
                 self.last_frame
                     .copy_from_slice(&input_frames[off..off + ch]);
                 self.frames_in += 1;
                 in_idx += 1;
-            }
-            if carry >= 65536 && in_idx >= in_frames {
-                // No more input to discharge the carry against.
-                // Cap the cursor so the next call's reseed starts
-                // cleanly. The bounded accepted artifact is
-                // noted in the module-level doc.
-                self.pos_q16 = 0;
-            } else {
-                self.pos_q16 = carry as u32;
             }
         }
 
@@ -377,17 +398,27 @@ impl ChannelMixer {
 /// composition order is fixed; reversing mangles the
 /// mono→stereo + SR-convert case.
 ///
-/// **Capacity**: `process` resizes the internal scratch buffer on
-/// overflow so it never silently truncates. v1 sizing rule: scratch
-/// starts at `8192 × input_channels` (covers 4096 input frames at
-/// worst-case 2× upsample); it grows once if a single input
-/// exceeds that bound.
+/// **Streaming interface**: `feed()` pushes input through the
+/// resampler + mixer and appends to an internal output FIFO.
+/// `drain()` copies from the FIFO to the caller's buffer.
+/// `process(input, out)` is a convenience wrapper that calls `feed`
+/// then `drain`. `pending_output_frames()` reports how many output
+/// frames are buffered.
+///
+/// **Capacity**: `feed` resizes the internal scratch buffer on
+/// overflow so it never silently truncates.
 pub struct FormatPipeline {
     resampler: LinearResampler,
     mixer: ChannelMixer,
     /// Scratch buffer for the resampler's INTERMEDIATE output
     /// (still in input_channels). Re-sized on overflow.
     scratch: Vec<f32>,
+    /// Output FIFO: accumulated final-output samples ready for
+    /// the cpal callback to drain.
+    fifo: Vec<f32>,
+    /// Read cursor within `fifo`. When `fifo_read == fifo.len()`,
+    /// both are cleared.
+    fifo_read: usize,
     /// Cumulative diagnostics.
     stats: FormatStats,
 }
@@ -403,15 +434,12 @@ impl FormatPipeline {
     ) -> Self {
         let resampler = LinearResampler::new(input_rate_hz, output_rate_hz, input_channels);
         let mixer = ChannelMixer::new(input_channels, output_channels);
-        // Initial scratch: 4096 input frames × 2 (worst-case 2×
-        // upsample) × input_channels (interleaved). v1 recv uses
-        // jitter-buffer packet chunks ≤ 1920 channels=2 samples,
-        // so 8192 is plenty for one packet; we grow on overflow.
-        let scratch_init = (4096usize * 2 * input_channels as usize).max(64);
         Self {
             resampler,
             mixer,
-            scratch: vec![0.0_f32; scratch_init],
+            scratch: Vec::new(),
+            fifo: Vec::new(),
+            fifo_read: 0,
             stats: FormatStats::default(),
         }
     }
@@ -433,6 +461,19 @@ impl FormatPipeline {
         &self.mixer
     }
 
+    /// Apply a drift correction in ppm to the underlying resampler.
+    /// See [`LinearResampler::set_drift_correction`] for details.
+    /// This also forces the pipeline into non-passthrough mode so
+    /// the resampler runs even when nominal rates match.
+    pub fn set_drift_correction(&mut self, ppm: f32) {
+        self.resampler.set_drift_correction(ppm);
+    }
+
+    /// Whether drift correction has been applied.
+    pub fn drift_active(&self) -> bool {
+        self.resampler.drift_active()
+    }
+
     /// Cumulative diagnostics.
     pub fn stats(&self) -> FormatStats {
         let rs = self.resampler.stats();
@@ -445,59 +486,107 @@ impl FormatPipeline {
         }
     }
 
-    /// Convert `input` (interleaved f32 at input-rate, input-channels)
-    /// into the cpal output buffer `out` (interleaved f32 at
-    /// output-rate, output-channels). Returns the number of OUTPUT
-    /// frames written.
-    pub fn process(&mut self, input: &[f32], out: &mut [f32]) -> usize {
+    /// Number of output frames buffered in the FIFO, ready for
+    /// `drain`.
+    pub fn pending_output_frames(&self) -> usize {
+        let oc = self.mixer.output_channels as usize;
+        if oc == 0 {
+            0
+        } else {
+            (self.fifo.len() - self.fifo_read) / oc
+        }
+    }
+
+    /// Push `input` (interleaved f32 at input-rate, input-channels)
+    /// through the resampler and mixer. Output is appended to the
+    /// internal FIFO; use `drain` to pull it into a cpal buffer.
+    pub fn feed(&mut self, input: &[f32]) {
         let ic = self.resampler.input_channels as usize;
         let oc = self.mixer.output_channels as usize;
-        debug_assert_eq!(
-            input.len() % ic,
-            0,
-            "input length must be a multiple of resampler input_channels"
-        );
-        debug_assert_eq!(
-            out.len() % oc,
-            0,
-            "out length must be a multiple of mixer output_channels"
-        );
-
-        // Resize scratch on overflow so we never silently truncate.
-        // The resampler's intermediate buffer is still in input-channel
-        // layout but must be able to hold as many *frames* as the caller's
-        // final output buffer can accept. Do not assume a 2× maximum
-        // upsample ratio here: real devices can legitimately pair a low-rate
-        // sender (for example 8 kHz telephony) with a high-rate output device
-        // (for example 192 kHz), and a fixed 2× scratch cap would make the
-        // pipeline write only the first few frames and zero-fill the rest.
-        let output_capacity_frames = out.len() / oc;
-        let ratio_bound_frames = input.len() / ic * 2 + 1;
-        let needed_scratch_frames = output_capacity_frames.max(ratio_bound_frames);
-        if self.scratch.len() / ic < needed_scratch_frames {
-            self.scratch.resize(needed_scratch_frames * ic, 0.0);
+        let in_frames = input.len() / ic;
+        if in_frames == 0 {
+            return;
         }
-        let scratch_cap_frames = self.scratch.len() / ic;
-        let scratch_for_resampler = needed_scratch_frames.min(scratch_cap_frames);
+
+        // Sizing: the resampler may produce up to
+        // ceil(in_frames * output_rate / input_rate) + a small
+        // slack for carry alignment. Generous bound avoids
+        // per-call resize.
+        let needed_scratch_frames = (in_frames as u64 * self.resampler.output_rate_hz as u64)
+            .div_ceil(self.resampler.input_rate_hz as u64)
+            as usize
+            + 16;
+
+        let scratch_needed = needed_scratch_frames * ic;
+        if self.scratch.len() < scratch_needed {
+            self.scratch.resize(scratch_needed, 0.0);
+        }
 
         let resampled = self
             .resampler
-            .process(input, &mut self.scratch[..scratch_for_resampler * ic]);
+            .process(input, &mut self.scratch[..scratch_needed]);
         if resampled == 0 {
-            return 0;
+            return;
         }
 
         let scratch_used = resampled * ic;
-        let mixed = self.mixer.process(&self.scratch[..scratch_used], out);
 
-        // Stats: only bump what was actually produced.
+        // Run mixer directly into the tail of the FIFO.
+        let fifo_start = self.fifo.len();
+        self.fifo.resize(fifo_start + resampled * oc, 0.0);
+        let mixed = self
+            .mixer
+            .process(&self.scratch[..scratch_used], &mut self.fifo[fifo_start..]);
+        // Trim any excess (mixed may be < resampled if mixer
+        // capacity was tighter — defensive).
+        self.fifo.truncate(fifo_start + mixed * oc);
+
+        // Stats.
         let rs = self.resampler.stats();
         self.stats.samples_in += input.len() as u64;
         self.stats.samples_out += mixed as u64 * oc as u64;
         self.stats.resampler_frames_in = rs.frames_in;
-        self.stats.resampler_frames_out = mixed as u64;
-        self.stats.mixer_frames_in = mixed as u64;
-        mixed
+        self.stats.resampler_frames_out = rs.frames_out;
+        self.stats.mixer_frames_in += mixed as u64;
+    }
+
+    /// Copy accumulated output from the FIFO into `out`. Returns
+    /// the number of OUTPUT frames written. Advances the internal
+    /// read cursor; compacts when the consumed region exceeds 4096
+    /// samples and is past the halfway mark.
+    pub fn drain(&mut self, out: &mut [f32]) -> usize {
+        let oc = self.mixer.output_channels as usize;
+        let available = self.fifo.len() - self.fifo_read;
+        let copy_len = available.min(out.len());
+        if copy_len == 0 {
+            return 0;
+        }
+
+        out[..copy_len].copy_from_slice(&self.fifo[self.fifo_read..self.fifo_read + copy_len]);
+        self.fifo_read += copy_len;
+
+        // Compact: when all consumed, clear outright. When the
+        // consumed prefix is large, shift the remainder forward.
+        if self.fifo_read == self.fifo.len() {
+            self.fifo.clear();
+            self.fifo_read = 0;
+        } else if self.fifo_read > 4096 && self.fifo_read > self.fifo.len() / 2 {
+            let unread = self.fifo.len() - self.fifo_read;
+            self.fifo.copy_within(self.fifo_read.., 0);
+            self.fifo.truncate(unread);
+            self.fifo_read = 0;
+        }
+
+        copy_len / oc
+    }
+
+    /// Convert `input` (interleaved f32 at input-rate, input-channels)
+    /// into the cpal output buffer `out` (interleaved f32 at
+    /// output-rate, output-channels). Returns the number of OUTPUT
+    /// frames written. Convenience wrapper: `feed` then `drain`.
+    pub fn process(&mut self, input: &[f32], out: &mut [f32]) -> usize {
+        self.feed(input);
+        self.drain(out)
     }
 }
 
@@ -539,13 +628,18 @@ mod unit {
 
     #[test]
     fn resampler_identity_passes_each_input_through_one_output() {
-        // 48 kHz mono, 8 input frames → 8 output frames.
+        // 48 kHz mono, 8 input frames → 7 output frames.
+        // Phase-continuous: the last input frame has no right anchor
+        // so it is not emitted in this call (carried as left anchor).
         let mut r = resampler_between(48_000, 48_000);
         let input: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let mut out = vec![0.0_f32; 9];
         let n = r.process(&input, &mut out);
-        assert_eq!(n, 8, "1:1 ratio must produce one output per input");
-        for (i, v) in out.iter().enumerate().take(8) {
+        assert_eq!(
+            n, 7,
+            "1:1 ratio: 8 inputs → 7 outputs (last is left anchor)"
+        );
+        for (i, v) in out.iter().enumerate().take(7) {
             assert_eq!(*v, i as f32, "out[{i}] must equal input frame {i}");
         }
     }
@@ -575,12 +669,9 @@ mod unit {
 
     #[test]
     fn resampler_2_to_1_downsample_interpolates_between_pairs() {
-        // 96 kHz → 48 kHz (2:1). Increasing ramp input.
+        // 96 kHz → 48 kHz (2:1). DC input.
         let mut r = resampler_between(96_000, 48_000);
         assert!(!r.is_passthrough());
-        // Use a DC input so we can verify the math is right
-        // without fluctuations; the exact output count varies by
-        // 1 across carry boundaries so we just verify values.
         let input = vec![0.5_f32; 10];
         let mut out = vec![0.0_f32; 6];
         let n = r.process(&input, &mut out);
@@ -596,39 +687,43 @@ mod unit {
     #[test]
     fn resampler_1_to_2_upsample_walks_at_half_step() {
         // 48 kHz → 96 kHz (1:2 upsample). Increasing ramp.
+        // Phase-continuous: produces fewer outputs than the old
+        // reseed-per-call loop, but the values are correct.
         let mut r = resampler_between(48_000, 96_000);
         assert!(!r.is_passthrough());
         let input: Vec<f32> = (0..5).map(|i| i as f32).collect();
         let mut out = vec![0.0_f32; 12];
         let n = r.process(&input, &mut out);
-        assert_eq!(n, 10, "1:2 upsample must produce 10 frames for 5 input");
-        assert_eq!(out[0], 0.0, "seeded first output");
+        // With phase-continuous Q32 and no echo, 5 input frames
+        // at 2× produce 8 outputs (each pair of inputs yields ~4
+        // outputs, minus the last frame which has no right anchor).
+        assert_eq!(n, 8, "1:2 upsample: 5 inputs → 8 outputs");
+        assert_eq!(out[0], 0.0, "seeded first output (t=0)");
         assert!((out[1] - 0.5).abs() < 1e-6, "half-step interp");
-        assert_eq!(out[2], 1.0, "anchor echo");
-        assert!((out[3] - 1.5).abs() < 1e-6, "t=0.5");
-        assert_eq!(out[8], 4.0, "last anchor");
-        assert_eq!(out[9], 4.0, "trailing last frame");
+        assert_eq!(out[2], 1.0, "anchor at input[1]");
+        assert!((out[3] - 1.5).abs() < 1e-6, "t=0.5 between [1] and [2]");
+        assert_eq!(out[6], 3.0, "anchor at input[3]");
+        assert!((out[7] - 3.5).abs() < 1e-6, "t=0.5 between [3] and [4]");
     }
 
     #[test]
     fn resampler_keeps_running_process_via_carry() {
         // Feed in two batches; verify second batch picks up where
-        // the first left off (no skip, no duplicate).
+        // the first left off (no skip, no duplicate, no reseed).
         let mut r = resampler_between(96_000, 48_000);
         let first = vec![1.0_f32; 4];
         let second = vec![2.0_f32; 4];
         let mut out1 = vec![0.0_f32; 4];
         let n1 = r.process(&first, &mut out1);
-        assert!(n1 >= 2, "first batch produced at least 2 outputs");
+        assert!(n1 >= 1, "first batch produced at least 1 output");
         let mut out2 = vec![0.0_f32; 4];
         let n2 = r.process(&second, &mut out2);
         for v in out1.iter().take(n1) {
-            assert!(
-                (v - 1.0).abs() < 1e-6 || (v - 1.5).abs() < 1e-6,
-                "first batch DC merge {v}"
-            );
+            // First batch: all DC=1.0 (input is constant 1.0)
+            assert!((v - 1.0).abs() < 1e-6, "first batch DC {v}");
         }
         for v in out2.iter().take(n2) {
+            // Second batch: may be 1.5 (carry from first) or 2.0
             assert!(
                 (v - 2.0).abs() < 1e-6 || (v - 1.5).abs() < 1e-6,
                 "second batch DC merge {v}"
@@ -707,8 +802,11 @@ mod unit {
         let input = [1.0_f32, -1.0, 0.5, 0.25, 0.0, 0.75, -0.5, 1.0];
         let mut out = [0.0_f32; 8];
         let n = p.process(&input, &mut out);
-        assert_eq!(n, 4);
-        assert_eq!(out, input);
+        // 4 stereo frames in, 3 out (last frame has no right anchor
+        // in this call — carried as left anchor for the next call).
+        assert_eq!(n, 3, "passthrough: 4 frames → 3 (last carried)");
+        // Verify the first 3 frames match.
+        assert_eq!(&out[..6], &[1.0, -1.0, 0.5, 0.25, 0.0, 0.75]);
     }
 
     #[test]
@@ -718,10 +816,10 @@ mod unit {
         let input = [0.4_f32, 0.6, -1.0, 1.0, 0.0, 0.0];
         let mut out = [0.0_f32; 3];
         let n = p.process(&input, &mut out);
-        assert_eq!(n, 3);
+        // 3 stereo frames → 2 mono frames (last carried).
+        assert_eq!(n, 2, "stereo→mono: 3 frames → 2 (last carried)");
         assert_eq!(out[0], 0.5);
         assert_eq!(out[1], 0.0);
-        assert_eq!(out[2], 0.0);
     }
 
     #[test]
@@ -731,8 +829,9 @@ mod unit {
         let input = [0.3_f32, -0.7, 0.0];
         let mut out = [0.0_f32; 6];
         let n = p.process(&input, &mut out);
-        assert_eq!(n, 3);
-        assert_eq!(out[..6], [0.3, 0.3, -0.7, -0.7, 0.0, 0.0]);
+        // 3 mono frames → 2 stereo frames (last carried).
+        assert_eq!(n, 2, "mono→stereo: 3 frames → 2 (last carried)");
+        assert_eq!(out[..4], [0.3, 0.3, -0.7, -0.7]);
     }
 
     #[test]
@@ -741,9 +840,11 @@ mod unit {
         let mut p = FormatPipeline::new(48_000, 44_100, 2, 1);
         assert!(!p.is_passthrough());
         let input = vec![0.5_f32; 400]; // 200 stereo frames × 2 channels
-        let mut out = vec![0.0_f32; 220];
-        let n = p.process(&input, &mut out);
-        assert!(n > 0);
+        p.feed(&input);
+        let n = p.pending_output_frames();
+        assert!(n > 0, "feed must produce output frames");
+        let mut out = vec![0.0_f32; n];
+        p.drain(&mut out);
         for (f, &v) in out[..n].iter().enumerate() {
             assert!((v - 0.5).abs() < 1e-6, "DC drift at frame {f}: {v}",);
         }
@@ -754,20 +855,20 @@ mod unit {
 
     #[test]
     fn pipeline_grows_scratch_on_oversized_input() {
-        // Initial scratch = 8192. Feed 10000 input frames to force
-        // a resize; verify scrambling doesn't lose samples.
+        // Feed 10000 input frames to force a resize; verify
+        // scrambling doesn't lose samples.
         let mut p = FormatPipeline::new(48_000, 44_100, 2, 2);
         let n_frames = 10_000;
         let input = [0.8_f32, -0.8_f32].repeat(n_frames);
-        let out_cap = (n_frames * 110 / 100) * 2 + 16;
-        let mut out = vec![0.0_f32; out_cap];
-        let n = p.process(&input, &mut out);
-        // ceil(input * out / in) = 9188 (10000 * 110 / 100 = 11000? no,
-        // we want (input * out/in) ≈ 10000 * 44100/48000 = 9187.5 → 9188).
+        p.feed(&input);
+        let n = p.pending_output_frames();
+        let mut out = vec![0.0_f32; n * 2];
+        p.drain(&mut out);
         let expected_n = (n_frames * 44_100).div_ceil(48_000);
-        assert_eq!(
-            n, expected_n,
-            "resampler must produce ceiling(input * out/in) frames"
+        // Allow ±1 for rounding at the last anchor boundary.
+        assert!(
+            (n as i64 - expected_n as i64).unsigned_abs() <= 1,
+            "expected ~{expected_n} output frames, got {n}"
         );
         for f in 0..n {
             let l = out[f * 2];
@@ -785,16 +886,69 @@ mod unit {
         // device, then the caller zero-filled most of the output callback.
         let mut p = FormatPipeline::new(8_000, 192_000, 1, 1);
         let input = vec![0.25_f32; 21];
-        let mut out = vec![0.0_f32; 480];
-
-        let n = p.process(&input, &mut out);
-
-        assert_eq!(
-            n, 480,
-            "24× upsample should fill the caller's output capacity"
-        );
+        p.feed(&input);
+        let n = p.pending_output_frames();
+        let mut out = vec![0.0_f32; n];
+        p.drain(&mut out);
+        assert!(n >= 480, "24× upsample should produce ≥480 frames, got {n}");
         for (f, &v) in out[..n].iter().enumerate() {
             assert!((v - 0.25).abs() < 1e-6, "DC drift at frame {f}: {v}");
+        }
+    }
+
+    #[test]
+    fn resampler_drift_regression_48k_to_44_1k() {
+        // 500 consecutive 512-frame output requests at 48k→44.1k
+        // must consume total_out × 48/44.1 ± 2 input frames.
+        let mut p = FormatPipeline::new(48_000, 44_100, 1, 1);
+        let mut total_in: u64 = 0;
+        let mut total_out: u64 = 0;
+        let mut out_buf = vec![0.0_f32; 512];
+
+        while total_out < 500 * 512 {
+            // Feed one frame at a time to simulate streaming.
+            p.feed(&[0.5_f32]);
+            total_in += 1;
+            while p.pending_output_frames() >= 512 {
+                let n = p.drain(&mut out_buf);
+                assert_eq!(n, 512, "drain must return exactly 512 frames");
+                total_out += n as u64;
+            }
+        }
+
+        let expected_in = total_out as f64 * 48_000.0 / 44_100.0;
+        let diff = (total_in as f64 - expected_in).abs();
+        assert!(
+            diff <= 2.0,
+            "drift exceeded ±2 input frames: total_in={total_in} \
+             expected={expected_in:.1} diff={diff:.3}"
+        );
+    }
+
+    #[test]
+    fn pipeline_feed_drain_pending_round_trip() {
+        // Verify feed/drain/pending_output_frames work together.
+        let mut p = FormatPipeline::new(48_000, 44_100, 1, 1);
+        assert_eq!(p.pending_output_frames(), 0, "no output before feed");
+
+        p.feed(&[0.5_f32; 480]); // 10 ms at 48 kHz
+        let pending = p.pending_output_frames();
+        assert!(pending > 0, "feed must produce output");
+        assert!(
+            pending <= 441,
+            "10 ms at 44.1 kHz ≈ 441 frames max, got {pending}"
+        );
+
+        let mut out = vec![0.0_f32; pending];
+        let drained = p.drain(&mut out);
+        assert_eq!(drained, pending, "drain must return all pending frames");
+        assert_eq!(
+            p.pending_output_frames(),
+            0,
+            "FIFO must be empty after full drain"
+        );
+        for (f, &v) in out.iter().enumerate() {
+            assert!((v - 0.5).abs() < 1e-6, "DC drift at frame {f}: {v}");
         }
     }
 }

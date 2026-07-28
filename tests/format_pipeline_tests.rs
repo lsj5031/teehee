@@ -137,10 +137,14 @@ fn pipeline_passthrough_via_jitter_is_byte_identical() {
 
     let mut out = vec![0.0_f32; SAMPLES_PER_PACKET];
     let written = pipeline.process(&scratch, &mut out);
-    assert_eq!(
-        written,
-        SAMPLES_PER_PACKET / 2,
-        "passthrough = one frame per input frame"
+    // Phase-continuous resampler: the last input frame has no right
+    // anchor so it's carried to the next call. Allow ±1 for the
+    // trailing-edge boundary.
+    let expected = SAMPLES_PER_PACKET / 2;
+    assert!(
+        written == expected || written == expected - 1,
+        "passthrough: expected {expected} or {e} output frames, got {written}",
+        e = expected - 1,
     );
     for f in 0..written {
         for c in 0..2 {
