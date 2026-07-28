@@ -40,6 +40,7 @@ use teehee::audio_io::{AudioCapture, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
 use teehee::capture_ring::CaptureRing;
 use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, ResolvedTarget, SendArgs};
+use teehee::clock_drift::ClockDriftTracker;
 use teehee::control::{self, ControlState, GainSource};
 use teehee::discovery;
 use teehee::format_pipeline::FormatPipeline;
@@ -48,7 +49,6 @@ use teehee::jitter::JitterBuffer;
 use teehee::jsonl_log::{JsonVal, JsonlLogger};
 use teehee::mtu_budget::compute_budget;
 use teehee::network::{Receiver, Sender};
-use teehee::clock_drift::ClockDriftTracker;
 use teehee::protocol::{DecodeStats, Packet, HEADER_LEN, MAX_PAYLOAD_LEN};
 
 fn main() -> anyhow::Result<()> {
@@ -294,8 +294,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // protocol limit. Packet::encode asserts payload ≤ 65535;
         // catch the violation at startup instead of panicking.
         if requested_payload_bytes > HEADER_LEN + MAX_PAYLOAD_LEN {
-            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000
-                / sample_rate as usize;
+            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000 / sample_rate as usize;
             anyhow::bail!(
                 "--chunk-ms {chunk_ms} at {sample_rate} Hz × {channels} ch \
                  produces {requested_payload_bytes} bytes per packet, exceeding \
@@ -585,8 +584,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // CLI accepts up to 200 ms, so this check is essential.
         let max_payload_len = HEADER_LEN + chunk_samples * 4;
         if max_payload_len > HEADER_LEN + MAX_PAYLOAD_LEN {
-            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000
-                / sample_rate as usize;
+            let max_ms = (MAX_PAYLOAD_LEN / 4 / channels as usize) * 1000 / sample_rate as usize;
             anyhow::bail!(
                 "--chunk-ms {chunk_ms} at {sample_rate} Hz × {channels} ch \
                  produces {max_payload_len} bytes per packet, exceeding the \

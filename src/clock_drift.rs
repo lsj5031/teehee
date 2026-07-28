@@ -163,11 +163,7 @@ impl ClockDriftTracker {
 
         // Evict samples outside the sliding window.
         let cutoff = t - self.window_secs;
-        while self
-            .samples
-            .front()
-            .is_some_and(|s| s.t < cutoff)
-        {
+        while self.samples.front().is_some_and(|s| s.t < cutoff) {
             self.samples.pop_front();
         }
 
@@ -405,7 +401,7 @@ mod unit {
         let mut t_mono = ClockDriftTracker::new(48_000, 4800, 1);
         for i in 0..200 {
             t_stereo.update(9600 + i * 20); // 20 samples = 10 frames at stereo
-            t_mono.update(4800 + i * 10);    // 10 frames
+            t_mono.update(4800 + i * 10); // 10 frames
         }
         let ppm_s = t_stereo.current_ppm();
         let ppm_m = t_mono.current_ppm();

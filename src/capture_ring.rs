@@ -60,9 +60,7 @@ impl CaptureRing {
         assert!(channels > 0);
         assert!(chunk_samples > 0);
         let ms = buffer_ms.clamp(CAPTURE_BUFFER_MIN_MS, CAPTURE_BUFFER_MAX_MS);
-        let frames_from_ms = (ms as u64)
-            .saturating_mul(sample_rate as u64)
-            / 1000;
+        let frames_from_ms = (ms as u64).saturating_mul(sample_rate as u64) / 1000;
         // FIX-5: force capacity to a whole number of audio frames.
         // A non-frame-aligned capacity (e.g. 4851 samples for 55 ms
         // at 44.1 kHz stereo) causes drop-oldest to drain a
@@ -121,7 +119,11 @@ impl CaptureRing {
                 let ch = self.channels as usize;
                 let aligned_overflow = if ch > 1 {
                     let aligned = (overflow / ch) * ch;
-                    if aligned == 0 { ch.min(overflow) } else { aligned }
+                    if aligned == 0 {
+                        ch.min(overflow)
+                    } else {
+                        aligned
+                    }
                 } else {
                     overflow
                 };
