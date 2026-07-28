@@ -663,7 +663,7 @@ mod unit {
         // Second call should apply constant gain (no ramp artifacts).
         let cs = ControlState::new();
         cs.set_gain_with_source(0.5, GainSource::Manual);
-        cs.apply_gain(&mut vec![1.0; 4]); // ramps from 1.0 → 0.5
+        cs.apply_gain(&mut [1.0; 4]); // ramps from 1.0 → 0.5
                                           // Now smoothed_gain is 0.5 and target is 0.5.
         let mut buf = vec![1.0, 2.0, -1.0, 0.0];
         cs.apply_gain(&mut buf);

@@ -607,6 +607,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let se = Arc::clone(&send_errors);
         let mut seq: u32 = 0;
         let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
+        #[allow(unused_assignments)]
         let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_samples);
         let period = Duration::from_millis(chunk_ms as u64);
         let mut next_tick = Instant::now();

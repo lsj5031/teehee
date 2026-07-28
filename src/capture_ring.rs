@@ -426,11 +426,11 @@ mod unit {
         assert_eq!(r.stats().overruns, 0, "no overflow yet");
 
         // Push 50 samples — triggers overflow of 50 samples.
-        r.push(&vec![2.0; 50]);
+        r.push(&[2.0; 50]);
         assert_eq!(r.stats().overruns, 50, "first overflow: 50 dropped");
 
         // Push another 30 samples — triggers overflow of 30.
-        r.push(&vec![3.0; 30]);
+        r.push(&[3.0; 30]);
         assert_eq!(r.stats().overruns, 80, "cumulative: 50 + 30 = 80");
     }
 
