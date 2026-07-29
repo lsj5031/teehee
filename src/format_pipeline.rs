@@ -490,11 +490,9 @@ impl FormatPipeline {
     /// `drain`.
     pub fn pending_output_frames(&self) -> usize {
         let oc = self.mixer.output_channels as usize;
-        if oc == 0 {
-            0
-        } else {
-            (self.fifo.len() - self.fifo_read) / oc
-        }
+        (self.fifo.len() - self.fifo_read)
+            .checked_div(oc)
+            .unwrap_or(0)
     }
 
     /// Push `input` (interleaved f32 at input-rate, input-channels)

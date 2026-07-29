@@ -386,11 +386,14 @@ pub fn read_and_apply_system_volume(state: &ControlState) -> Result<f32, &'stati
 pub fn spawn_volume_follower(state: ControlState) {
     #[cfg(not(target_os = "windows"))]
     {
+        // `state` is part of the shared signature but only consumed by
+        // the Windows branch below; bind it here so non-Windows builds
+        // don't trip clippy::unused_variables on the parameter.
+        let _ = state;
         tracing::warn!(
             "--follow-system-volume has no effect on this platform \
              (Windows WASAPI only); the flag is accepted but ignored"
         );
-        return;
     }
 
     #[cfg(target_os = "windows")]
