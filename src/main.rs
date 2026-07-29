@@ -356,12 +356,23 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 }
                 seq = seq.wrapping_add(1);
 
+                // Pacing: maintain a steady chunk_ms cadence. When
+                // the loop is on or ahead of schedule, sleep until
+                // the next tick. When behind, BURST — skip the sleep
+                // and let the next iteration's `next_tick += period`
+                // keep us behind `now`, so we send several packets
+                // back-to-back to drain the backlog. The deficit is
+                // bounded by SEND_CATCHUP_BOUND so a long stall does
+                // not trigger an infinite burst. (The previous
+                // `next_tick = now` reset discarded the deficit,
+                // which let a single stall permanently shift the
+                // schedule later and peg the capture ring.)
                 next_tick += period;
                 let now = Instant::now();
                 if next_tick > now {
                     thread::sleep(next_tick - now);
-                } else {
-                    next_tick = now;
+                } else if now - next_tick > SEND_CATCHUP_BOUND {
+                    next_tick = now - SEND_CATCHUP_BOUND;
                 }
             }
         });
@@ -667,12 +678,28 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             // R1 FIX: unconditional pacing at chunk_ms. Every
             // send (real, silence, or after transient error) hits
             // this sleep, maintaining a steady packet rate.
+            //
+            // Catch-up: when the loop falls behind schedule (OS
+            // scheduling hiccup, transient send error, pause/
+            // resume), it burst-sends by skipping the sleep and
+            // leaving `next_tick` behind `now` so the next
+            // iteration also skips — draining the capture-ring
+            // backlog instead of pegging it. The deficit is
+            // bounded by SEND_CATCHUP_BOUND so a long stall does
+            // not trigger an infinite burst of stale/silence
+            // packets. The previous `next_tick = now` reset
+            // discarded the deficit: after a stall the loop
+            // resumed a steady 1-packet-per-period pace that could
+            // never exceed the capture rate, so the ring stayed
+            // full and continuously drop-oldest'd audio (observed
+            // capture_overruns climbing ~9 ms/s on a chunk_ms=3
+            // loopback stream).
             next_tick += period;
             let now = Instant::now();
             if next_tick > now {
                 thread::sleep(next_tick - now);
-            } else {
-                next_tick = now;
+            } else if now - next_tick > SEND_CATCHUP_BOUND {
+                next_tick = now - SEND_CATCHUP_BOUND;
             }
         }
     }
@@ -808,7 +835,43 @@ struct RxState {
     /// the drift-tracker update is skipped for one callback to
     /// avoid poisoning the slope with the fill discontinuity.
     last_trim_count: u64,
+    /// Wall-clock instant this `RxState` was constructed (first
+    /// packet, or rebuild on format change). The cpal callback
+    /// withholds `drift_tracker.update()` calls until
+    /// `created_at.elapsed() >= DRIFT_SETTLE_DELAY` so the
+    /// prebuffer-gate opening transient (fill ramping 0 → target)
+    /// cannot poison the regression window with a false-positive
+    /// slope. See [`DRIFT_SETTLE_DELAY`] and the startup-transient
+    /// section in `clock_drift.rs`.
+    created_at: Instant,
 }
+
+/// Sender pacing catch-up bound. When the encode loop falls behind
+/// its `chunk_ms` schedule (OS scheduling hiccup, transient send
+/// error, pause/resume), it burst-sends (skips the inter-packet
+/// sleep) to drain the backlog — instead of discarding the timing
+/// deficit and resuming a steady 1-packet-per-period pace that can
+/// never catch up. The deficit is bounded so a long stall (e.g. a
+/// 10 s pause) does not trigger a multi-second burst of stale or
+/// silence packets: anything older than the capture ring's depth is
+/// already drop-oldest'd, so catching up further would only flood
+/// the receiver with silence. 200 ms matches the default
+/// `--capture-buffer-ms` and is at most ~67 chunks at `chunk_ms=3`.
+const SEND_CATCHUP_BOUND: Duration = Duration::from_millis(200);
+
+/// Drift-tracker settle delay: withhold drift sampling for this long
+/// after `RxState` creation (first packet / format-change rebuild).
+/// The prebuffer gate opens at ~`--prebuffer-ms` and the fill then
+/// wanders for ~1–2 s while the sender/receiver rate balance settles.
+/// 3 s comfortably covers the gate opening plus the post-gate fill
+/// transient on a typical `--prebuffer-ms 200` LAN stream, after
+/// which the regression window starts on stable data. The tracker
+/// stays cold during this window (`is_warmed_up` false, `current_ppm`
+/// 0), so the resampler remains in passthrough and no correction is
+/// applied. Real crystal drift accumulating uncorrected over 3 s at
+/// ±200 ppm is ±0.6 ms of buffer skew — negligible and self-corrected
+/// once the tracker engages.
+const DRIFT_SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 /// Receiver pipeline. Bounded to a single, default output device for
 /// v1.
@@ -967,7 +1030,16 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         // and apply the correction to the resampler. This runs every
         // cpal callback (~10 ms) and is O(1) except for the sliding-
         // window regression which uses a small ring buffer.
-        if !skip_drift {
+        //
+        // Startup-transient guard: withhold drift sampling for
+        // DRIFT_SETTLE_DELAY after RxState creation so the
+        // prebuffer-gate opening ramp (fill 0 → target) cannot
+        // poison the regression window with a false-positive slope
+        // that clamps the correction and overshoots. The tracker
+        // stays cold (is_warmed_up false) so no correction is
+        // applied and the resampler remains in passthrough.
+        let settled = state.created_at.elapsed() >= DRIFT_SETTLE_DELAY;
+        if !skip_drift && settled {
             let qf = state.jb.queued_frames();
             state.drift_tracker.update(qf);
         }
@@ -1181,6 +1253,7 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             scratch: Vec::new(),
                             last_underrun_count: 0,
                             last_trim_count: 0,
+                            created_at: Instant::now(),
                         });
                         info!(
                             sender_sample_rate = sent_rate,
@@ -1277,6 +1350,7 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 scratch: Vec::new(),
                                 last_underrun_count: 0,
                                 last_trim_count: 0,
+                                created_at: Instant::now(),
                             };
                         }
                     }

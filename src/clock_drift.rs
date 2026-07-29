@@ -12,8 +12,8 @@
 //! and derives a rate-correction factor (ppm) that nudges the
 //! [`LinearResampler`]'s step size to keep the buffer at its target
 //! fill. The correction is smooth (no audible wow/flutter at the
-//! chosen gains) and converges within a few minutes (time constant
-//! ≈ 104 s at kp=0.2, 95 % settled in ≈ 5 min).
+//! chosen gains) and converges within ~15 minutes (time constant
+//! ≈ 260 s at kp=0.08, 95 % settled in ≈ 13 min).
 //!
 //! ## Algorithm
 //!
@@ -40,6 +40,22 @@
 //! [`FormatPipeline::set_drift_correction`] which adjusts the
 //! resampler's `step_q32` by that fraction.
 //!
+//! ## Startup-transient suppression
+//!
+//! The tracker must NOT be fed samples during the prebuffer-gate
+//! opening transient. While the receiver accumulates its first
+//! `--prebuffer-ms` of audio, the jitter-buffer fill ramps from 0
+//! to the gate target; a regression over that ramp yields a huge
+//! false-positive slope (observed ~2700 frames/sec on a 48 kHz
+//! stream) that clamps the correction to `+MAX_DRIFT_PPM` for
+//! several seconds and then overshoots to `−MAX_DRIFT_PPM`,
+//! producing audible wow/flutter. The caller (in `main.rs`) is
+//! responsible for withholding `update()` calls until the gate has
+//! opened and the fill has settled (a fixed settle delay after
+//! `RxState` creation); the tracker itself stays cold (`warmed_up`
+//! false, `current_ppm` 0) until then, so no correction is applied
+//! and the resampler remains in passthrough.
+//!
 //! ## Thread safety
 //!
 //! `ClockDriftTracker` is `!Send` / `!Sync` (no `unsafe impl`). It
@@ -51,11 +67,18 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-/// Maximum absolute drift correction in ppm. At ±500 ppm the
-/// resampler's step changes by 0.05% — inaudible per callback
-/// (~0.005 samples per 512-frame block at 48 kHz). The bound
-/// prevents runaway corrections from destabilizing the pipeline.
-const MAX_DRIFT_PPM: f32 = 500.0;
+/// Maximum absolute drift correction in ppm. Real sender/receiver
+/// crystal skew on a LAN is ±50–200 ppm; the previous ±500 bound
+/// was wide enough that a startup-transient false-positive slope
+/// could clamp the correction for several seconds and overshoot to
+/// the opposite clamp, producing audible wow/flutter (a 0.1 %
+/// peak-to-peak playback-rate swing). ±150 ppm (0.015% step change
+/// per callback) covers real crystal drift while preventing any
+/// single false-positive from driving a multi-second saturating
+/// drain. Inaudible per callback (~0.0015 samples per 512-frame
+/// block at 48 kHz) and bounds the cumulative wobble to 0.03 %
+/// peak-to-peak.
+const MAX_DRIFT_PPM: f32 = 150.0;
 
 /// Default sliding window duration in seconds. Longer windows give
 /// more stable slope estimates but slower convergence. 8 seconds
@@ -68,14 +91,18 @@ const MIN_SAMPLES: usize = 50;
 
 /// Default proportional gain: ppm correction per *frame* of offset
 /// from the target (after the D1 fix normalises interleaved samples
-/// to audio frames). At kp=0.2 and 48 kHz, a 100-frame overshoot
-/// (~2 ms at stereo) produces 20 ppm correction — well within the
-/// ±500 ppm clamp and inaudible. The resulting time constant is
-/// τ ≈ 1 000 000 / (kp × nominal_rate) ≈ 104 s at 48 kHz, giving
-/// 95 % convergence in ≈ 5 min. This is 10× the original 0.02
-/// (which gave τ ≈ 17 min for mono, ≈ 9 min for stereo) while
-/// staying gentle enough to avoid oscillation under OS sleep jitter.
-const DEFAULT_KP: f32 = 0.2;
+/// to audio frames). At kp=0.08 and 48 kHz, a 100-frame overshoot
+/// (~2 ms at stereo) produces 8 ppm correction — well within the
+/// ±150 ppm clamp and inaudible. The resulting time constant is
+/// τ ≈ 1 000 000 / (kp × nominal_rate) ≈ 260 s at 48 kHz, giving
+/// 95 % convergence in ≈ 13 min. This is 4× the original 0.02 and
+/// 2.5× lower than the 0.2 that produced observable startup
+/// oscillation (the P-term alone hit ~288 ppm on a 30 ms fill error
+/// and fed the clamp/overshoot loop); 0.08 keeps the P-term under
+/// the new ±150 clamp even on a 30 ms (~1440-frame) error
+/// (0.08 × 1440 ≈ 115 ppm) so the controller cannot saturate from
+/// the proportional term alone.
+const DEFAULT_KP: f32 = 0.08;
 
 /// A single measurement point: elapsed time since tracker creation
 /// and the jitter-buffer fill at that instant, in *audio frames*
@@ -367,9 +394,9 @@ mod unit {
         let ppm = t.current_ppm();
         // The slope is ~0 (stable), but the proportional term should
         // produce a positive correction (drain faster to reach target).
-        // With kp=0.2 and 500 frames offset: p_ppm = 0.2 * 500 = 100.
+        // With kp=0.08 and 500 frames offset: p_ppm = 0.08 * 500 = 40.
         assert!(
-            ppm > 50.0,
+            ppm > 20.0,
             "fill above target should produce positive correction, got {ppm} ppm"
         );
     }
