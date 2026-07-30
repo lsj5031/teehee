@@ -80,6 +80,12 @@ use std::time::Instant;
 /// peak-to-peak.
 const MAX_DRIFT_PPM: f32 = 150.0;
 
+/// Maximum correction change per audio callback. At a typical
+/// 10 ms callback cadence this permits 50 ppm/sec, enough to track
+/// crystal drift while preventing a transient fill cliff from
+/// flipping the resampler directly between the ±150 ppm clamps.
+const MAX_PPM_STEP_PER_UPDATE: f32 = 0.5;
+
 /// Default sliding window duration in seconds. Longer windows give
 /// more stable slope estimates but slower convergence. 8 seconds
 /// balances both.
@@ -209,7 +215,13 @@ impl ClockDriftTracker {
         // up (consume faster). A positive m means we need a POSITIVE
         // ppm correction (increase step → produce more output per
         // input → drain faster).
-        let drift_ppm = if self.nominal_rate > 0 {
+        // The slope term is not meaningful until one complete time
+        // window has elapsed. MIN_SAMPLES (~500 ms) is enough to
+        // start the gentle proportional controller, but applying a
+        // regression slope over that short interval amplified one
+        // callback-sized fill cliff into alternating ±150 ppm
+        // corrections (audible as a periodic pulse).
+        let drift_ppm = if t >= self.window_secs && self.nominal_rate > 0 {
             (m / self.nominal_rate as f64) * 1_000_000.0
         } else {
             0.0
@@ -222,9 +234,14 @@ impl ClockDriftTracker {
         let offset = latest - self.target_frames;
         let p_ppm = self.kp as f64 * offset;
 
-        // Total correction, clamped.
+        // Clamp the target, then slew toward it. Real crystal skew
+        // changes slowly; an immediate correction sign-flip is a
+        // transient buffer-fill artifact, not physical clock drift.
         let total = (drift_ppm + p_ppm) as f32;
-        self.current_ppm = total.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM);
+        let target_ppm = total.clamp(-MAX_DRIFT_PPM, MAX_DRIFT_PPM);
+        let delta = (target_ppm - self.current_ppm)
+            .clamp(-MAX_PPM_STEP_PER_UPDATE, MAX_PPM_STEP_PER_UPDATE);
+        self.current_ppm += delta;
         self.current_slope = m as f32;
     }
 
@@ -398,6 +415,21 @@ mod unit {
         assert!(
             ppm > 20.0,
             "fill above target should produce positive correction, got {ppm} ppm"
+        );
+    }
+
+    #[test]
+    fn correction_is_slew_limited_per_update() {
+        let mut t = make_tracker(9600);
+        for _ in 0..MIN_SAMPLES {
+            t.update(9600);
+        }
+        let before = t.current_ppm();
+        t.update(100_000);
+        let delta = (t.current_ppm() - before).abs();
+        assert!(
+            delta <= MAX_PPM_STEP_PER_UPDATE + f32::EPSILON,
+            "correction changed {delta} ppm in one update; max is {MAX_PPM_STEP_PER_UPDATE}"
         );
     }
 

@@ -122,6 +122,100 @@ impl Drop for HighResTimer {
     }
 }
 
+struct SendPacer {
+    period: Duration,
+    next_tick: Instant,
+    #[cfg(target_os = "windows")]
+    timer: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+impl SendPacer {
+    fn new(period: Duration) -> Self {
+        #[cfg(target_os = "windows")]
+        let timer = {
+            use windows::core::PCWSTR;
+            use windows::Win32::System::Threading::{
+                CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+            };
+
+            let high_res = unsafe {
+                CreateWaitableTimerExW(
+                    None,
+                    PCWSTR::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS.0,
+                )
+            };
+            let timer = high_res
+                .or_else(|_| unsafe {
+                    CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0)
+                })
+                .ok();
+            if timer.is_some() {
+                tracing::debug!("Windows waitable timer enabled for sender pacing");
+            } else {
+                tracing::warn!("Windows waitable timer unavailable; using thread::sleep pacing");
+            }
+            timer
+        };
+
+        Self {
+            period,
+            next_tick: Instant::now(),
+            #[cfg(target_os = "windows")]
+            timer,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.next_tick = Instant::now();
+    }
+
+    fn wait_next(&mut self) {
+        self.next_tick += self.period;
+        let now = Instant::now();
+        if self.next_tick > now {
+            self.sleep_until(self.next_tick);
+        } else if now - self.next_tick > SEND_CATCHUP_BOUND {
+            self.next_tick = now - SEND_CATCHUP_BOUND;
+        }
+    }
+
+    fn sleep_until(&self, deadline: Instant) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(timer) = self.timer {
+            use windows::Win32::Foundation::WAIT_OBJECT_0;
+            use windows::Win32::System::Threading::{
+                SetWaitableTimer, WaitForSingleObject, INFINITE,
+            };
+
+            let ticks_100ns = remaining.as_nanos().div_ceil(100).min(i64::MAX as u128) as i64;
+            let due_time = -ticks_100ns.max(1);
+            if unsafe { SetWaitableTimer(timer, &due_time, 0, None, None, false) }.is_ok()
+                && unsafe { WaitForSingleObject(timer, INFINITE) } == WAIT_OBJECT_0
+            {
+                return;
+            }
+        }
+
+        thread::sleep(remaining);
+    }
+}
+
+impl Drop for SendPacer {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(timer) = self.timer.take() {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(timer) };
+        }
+    }
+}
+
 /// Sender pipeline. Choose capture path based on `args.sine`.
 fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // Windows: request 1 ms timer resolution for accurate send
@@ -313,13 +407,16 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             let mut sine = SineSource::new(sample_rate, channels, 440.0);
             let mut chunk_buf = vec![0.0_f32; chunk_frames * channels as usize];
             let period = Duration::from_millis(chunk_ms as u64);
+            let mut pacer = SendPacer::new(period);
             let mut seq: u32 = 0;
-            let mut next_tick = Instant::now();
             let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
             loop {
                 // Runtime control: pause/resume/volume.
-                while ctrl.is_paused() {
-                    thread::sleep(Duration::from_millis(250));
+                if ctrl.is_paused() {
+                    while ctrl.is_paused() {
+                        thread::sleep(Duration::from_millis(250));
+                    }
+                    pacer.reset();
                 }
 
                 sine.fill_chunk(&mut chunk_buf);
@@ -355,25 +452,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                     ps.fetch_add(1, Ordering::Relaxed);
                 }
                 seq = seq.wrapping_add(1);
-
-                // Pacing: maintain a steady chunk_ms cadence. When
-                // the loop is on or ahead of schedule, sleep until
-                // the next tick. When behind, BURST — skip the sleep
-                // and let the next iteration's `next_tick += period`
-                // keep us behind `now`, so we send several packets
-                // back-to-back to drain the backlog. The deficit is
-                // bounded by SEND_CATCHUP_BOUND so a long stall does
-                // not trigger an infinite burst. (The previous
-                // `next_tick = now` reset discarded the deficit,
-                // which let a single stall permanently shift the
-                // schedule later and peg the capture ring.)
-                next_tick += period;
-                let now = Instant::now();
-                if next_tick > now {
-                    thread::sleep(next_tick - now);
-                } else if now - next_tick > SEND_CATCHUP_BOUND {
-                    next_tick = now - SEND_CATCHUP_BOUND;
-                }
+                pacer.wait_next();
             }
         });
 
@@ -620,8 +699,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
         #[allow(unused_assignments)]
         let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_samples);
-        let period = Duration::from_millis(chunk_ms as u64);
-        let mut next_tick = Instant::now();
+        let mut pacer = SendPacer::new(Duration::from_millis(chunk_ms as u64));
         loop {
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
@@ -634,7 +712,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 }
                 // Reset pacing clock so we don't burst-send after
                 // resuming from a long pause.
-                next_tick = Instant::now();
+                pacer.reset();
                 continue;
             }
             chunk_buf = {
@@ -674,33 +752,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 ps.fetch_add(1, Ordering::Relaxed);
             }
             seq = seq.wrapping_add(1);
-
-            // R1 FIX: unconditional pacing at chunk_ms. Every
-            // send (real, silence, or after transient error) hits
-            // this sleep, maintaining a steady packet rate.
-            //
-            // Catch-up: when the loop falls behind schedule (OS
-            // scheduling hiccup, transient send error, pause/
-            // resume), it burst-sends by skipping the sleep and
-            // leaving `next_tick` behind `now` so the next
-            // iteration also skips — draining the capture-ring
-            // backlog instead of pegging it. The deficit is
-            // bounded by SEND_CATCHUP_BOUND so a long stall does
-            // not trigger an infinite burst of stale/silence
-            // packets. The previous `next_tick = now` reset
-            // discarded the deficit: after a stall the loop
-            // resumed a steady 1-packet-per-period pace that could
-            // never exceed the capture rate, so the ring stayed
-            // full and continuously drop-oldest'd audio (observed
-            // capture_overruns climbing ~9 ms/s on a chunk_ms=3
-            // loopback stream).
-            next_tick += period;
-            let now = Instant::now();
-            if next_tick > now {
-                thread::sleep(next_tick - now);
-            } else if now - next_tick > SEND_CATCHUP_BOUND {
-                next_tick = now - SEND_CATCHUP_BOUND;
-            }
+            pacer.wait_next();
         }
     }
 }
