@@ -27,7 +27,7 @@
 //! stream at open time and paired with the sender-side format on
 //! first packet arrival to lazily initialize both pieces.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,7 +40,7 @@ use teehee::audio_io::{AudioCapture, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
 use teehee::capture_ring::CaptureRing;
 use teehee::cli::{CaptureSource, Cli, Command, RecvArgs, ResolvedTarget, SendArgs};
-use teehee::clock_drift::ClockDriftTracker;
+use teehee::clock_drift::{ClockDriftTracker, Ema};
 use teehee::control::{self, ControlState, GainSource};
 use teehee::discovery;
 use teehee::format_pipeline::FormatPipeline;
@@ -171,6 +171,15 @@ impl SendPacer {
         self.next_tick = Instant::now();
     }
 
+    /// Change the pacing period. The absolute schedule is
+    /// preserved — `next_tick` is untouched, so the new period
+    /// applies from the next tick without a phase jump. Used by
+    /// the sender's drift compensator to lock the drain rate to
+    /// the capture clock.
+    fn set_period(&mut self, period: Duration) {
+        self.period = period;
+    }
+
     fn wait_next(&mut self) {
         self.next_tick += self.period;
         let now = Instant::now();
@@ -285,6 +294,13 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // Capture-ring metrics for real-capture path; sine mode leaves
     // these at zero (no capture ring).
     let capture_ring_slot: Arc<Mutex<Option<CaptureRing>>> = Arc::new(Mutex::new(None));
+    // Sender-side drift compensation: the encode loop writes the
+    // current correction (ppm) and fill slope (frames/sec), the
+    // stats thread reads them for --stats / JSONL. f32 stored as
+    // atomic bits; zero until the tracker warms up. Sine mode
+    // leaves them at zero (no capture ring to compensate).
+    let send_drift_ppm = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let send_drift_slope = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
     // Runtime control: TCP server on 127.0.0.1 (opt-in via --control-port).
     // Default is disabled (port 0); pass --control-port 9090 (or any
@@ -464,6 +480,8 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&fragmentations),
                 Arc::clone(&send_errors),
                 Arc::clone(&capture_ring_slot),
+                Arc::clone(&send_drift_ppm),
+                Arc::clone(&send_drift_slope),
                 args.stats,
                 Arc::clone(&jsonl),
                 control.clone(),
@@ -661,6 +679,8 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&fragmentations),
                 Arc::clone(&send_errors),
                 Arc::clone(&ring_slot),
+                Arc::clone(&send_drift_ppm),
+                Arc::clone(&send_drift_slope),
                 args.stats,
                 Arc::clone(&jsonl),
                 control.clone(),
@@ -699,7 +719,60 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
         #[allow(unused_assignments)]
         let mut chunk_buf: Vec<f32> = Vec::with_capacity(chunk_samples);
-        let mut pacer = SendPacer::new(Duration::from_millis(chunk_ms as u64));
+        // ── Sender-side clock-drift compensation ─────────────────
+        // The encode loop paces by the wall clock (SendPacer), but
+        // the capture device delivers on its own clock (±10–200 ppm
+        // vs nominal). Wall-clock-only pacing leaves the capture
+        // ring with NO restoring force: a capture clock faster than
+        // the wall clock leaks ring fill upward (delay grows for
+        // hours until the drop-oldest cap causes audible skips); a
+        // slower capture clock drains the ring to empty, pops fail,
+        // and the sender emits silence chunks (micro-dropouts). The
+        // drift tracker measures the ring-fill slope and nudges the
+        // pacing period (period_for_ppm) so the ring converges to a
+        // small target fill and stays there — the same algorithm
+        // the receiver uses for its jitter buffer.
+        let base_period = Duration::from_millis(chunk_ms as u64);
+        let mut pacer = SendPacer::new(base_period);
+        // Target fill: at least 2 chunks, minimum 15 ms. The WASAPI
+        // delivery sawtooth (batch size ≈ 10-20 ms) makes the ring
+        // oscillate ±half a batch around the target; the target must
+        // sit above half-batch + one chunk so pops never starve at
+        // the sawtooth trough (a failed pop would emit a silence
+        // chunk — a micro-dropout). 15 ms keeps the trough ≥ 1 chunk
+        // for typical batch sizes with negligible added latency.
+        // In interleaved samples.
+        let target_ms = (chunk_ms * 2).max(15);
+        let target_samples = target_ms * sample_rate as usize * channels as usize / 1000;
+        // 30 s regression window: the capture ring's batch-delivery
+        // wander (10–30 s periods) would otherwise dominate the 8 s
+        // default and swing the correction ±100 ppm.
+        let mut drift = ClockDriftTracker::with_window(sample_rate, target_samples, channels, 30.0);
+        // EMA of the post-pop ring depth with τ ≈ 300 ms (α = 0.01
+        // at 333 updates/s). The heavy smoothing suppresses the
+        // delivery sawtooth and scheduler jitter so the regression
+        // sees the mean fill — feeding it the raw sawtooth made the
+        // slope estimate so noisy that the correction limit-cycled
+        // between the ±150 ppm clamps every few seconds.
+        const EMA_ALPHA: f64 = 0.01;
+        let mut ema_depth = Ema::new(EMA_ALPHA);
+        // Startup settle delay: withhold drift sampling while the
+        // ring fills from 0 to the target on first audio — the fill
+        // ramp would otherwise register as a huge false-positive
+        // slope and slam the correction into the clamp (the same
+        // transient the receiver's DRIFT_SETTLE_DELAY guards
+        // against). Re-armed on pause/resume (the ring clear is the
+        // same fill cliff).
+        let mut drift_started_at = Instant::now();
+        // Bounded catch-up: after a stall longer than the pacer's
+        // 200 ms debt window, burst-send up to SEND_CATCHUP_BOUND
+        // of backlog so the ring recovers quickly instead of
+        // ratcheting toward the drop-oldest cap. Real audio only
+        // (bursting stops once the ring is below its high-water
+        // mark), and bounded so the receiver's jitter buffer is
+        // never flooded.
+        let mut bursting = false;
+        let mut burst_budget = Duration::ZERO;
         loop {
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
@@ -711,20 +784,57 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                     }
                 }
                 // Reset pacing clock so we don't burst-send after
-                // resuming from a long pause.
+                // resuming from a long pause. The ring-clear fill
+                // cliff would also poison the drift regression.
                 pacer.reset();
+                drift.reset();
+                ema_depth.reset();
+                bursting = false;
+                burst_budget = Duration::ZERO;
+                drift_started_at = Instant::now();
                 continue;
             }
-            chunk_buf = {
+            let (should_burst, post_pop_depth) = {
                 let mut guard = ring_slot.lock().unwrap();
                 match guard.as_mut() {
-                    Some(ring) => match ring.pop_chunk(chunk_samples) {
-                        Some(c) => c,
-                        None => vec![0.0f32; chunk_samples],
-                    },
-                    None => vec![0.0f32; chunk_samples],
+                    Some(ring) => {
+                        let chunk = ring.pop_chunk(chunk_samples);
+                        let depth = ring.len();
+                        chunk_buf = chunk.unwrap_or_else(|| vec![0.0f32; chunk_samples]);
+                        (ring.should_catch_up(), depth)
+                    }
+                    None => {
+                        chunk_buf = vec![0.0f32; chunk_samples];
+                        (false, 0)
+                    }
                 }
             };
+            // Drift compensation + bounded catch-up. Drift updates
+            // are withheld while bursting — the fast drain would
+            // poison the slope regression, so the tracker is reset
+            // at burst start and re-learns once pacing resumes.
+            let burst_now = should_burst && burst_budget < SEND_CATCHUP_BOUND;
+            if burst_now {
+                if !bursting {
+                    drift.reset();
+                    ema_depth.reset();
+                }
+                bursting = true;
+                burst_budget += base_period;
+            } else if drift_started_at.elapsed() >= Duration::from_secs(5) {
+                bursting = false;
+                burst_budget = Duration::ZERO;
+                drift.update(ema_depth.update(post_pop_depth as f64) as usize);
+                let ppm = drift.current_ppm();
+                send_drift_ppm.store(ppm.to_bits(), Ordering::Relaxed);
+                send_drift_slope.store(drift.current_slope().to_bits(), Ordering::Relaxed);
+                if ppm != 0.0 {
+                    pacer.set_period(teehee::clock_drift::period_for_ppm(base_period, ppm));
+                }
+            } else {
+                bursting = false;
+                burst_budget = Duration::ZERO;
+            }
             control.apply_gain(&mut chunk_buf);
             let frame_ts = (seq as u64) * chunk_frames as u64;
             let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk_buf);
@@ -752,7 +862,9 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 ps.fetch_add(1, Ordering::Relaxed);
             }
             seq = seq.wrapping_add(1);
-            pacer.wait_next();
+            if !burst_now {
+                pacer.wait_next();
+            }
         }
     }
 }
@@ -768,6 +880,8 @@ fn spawn_periodic_sender_stats(
     fragmentations: Arc<AtomicU64>,
     send_errors: Arc<AtomicU64>,
     capture_ring: Arc<Mutex<Option<CaptureRing>>>,
+    send_drift_ppm: Arc<AtomicU32>,
+    send_drift_slope: Arc<AtomicU32>,
     console: bool,
     jsonl: Arc<JsonlLogger>,
     control: ControlState,
@@ -795,6 +909,8 @@ fn spawn_periodic_sender_stats(
             let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
             let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
             let capture_ring_samples = ring_stats.map(|s| s.samples).unwrap_or(0);
+            let send_drift_ppm = f32::from_bits(send_drift_ppm.load(Ordering::Relaxed));
+            let send_drift_slope = f32::from_bits(send_drift_slope.load(Ordering::Relaxed));
             let paused = control.is_paused();
             let gain = control.gain();
             let gain_source = match control.gain_source() {
@@ -813,6 +929,8 @@ fn spawn_periodic_sender_stats(
                     capture_ring_high_water_ms,
                     capture_overruns,
                     capture_ring_samples,
+                    send_drift_ppm = format!("{send_drift_ppm:.1}"),
+                    send_drift_slope = format!("{send_drift_slope:.1}"),
                     paused,
                     gain = format!("{:.2}", gain),
                     gain_source,
@@ -835,6 +953,8 @@ fn spawn_periodic_sender_stats(
                     ),
                     ("capture_overruns", JsonVal::from(capture_overruns)),
                     ("capture_ring_samples", JsonVal::from(capture_ring_samples)),
+                    ("send_drift_ppm", JsonVal::from(send_drift_ppm as f64)),
+                    ("send_drift_slope", JsonVal::from(send_drift_slope as f64)),
                     ("paused", JsonVal::from(paused)),
                     ("gain", JsonVal::from(gain as f64)),
                     ("gain_source", JsonVal::from(gain_source)),
@@ -896,6 +1016,13 @@ struct RxState {
     /// slope. See [`DRIFT_SETTLE_DELAY`] and the startup-transient
     /// section in `clock_drift.rs`.
     created_at: Instant,
+    /// EMA of the jitter-buffer fill (interleaved samples) fed to
+    /// the drift tracker. Smooths arrival burstiness so the
+    /// regression sees the mean fill (see `DRIFT_EMA_ALPHA`).
+    drift_ema: Ema,
+    /// Raw `queued_frames()` from the previous callback, for the
+    /// burst guard (`DRIFT_BURST_RESET_MS`). `None` = unset.
+    last_raw_queued: Option<usize>,
 }
 
 /// Sender pacing catch-up bound. When the encode loop falls behind
@@ -924,6 +1051,24 @@ const SEND_CATCHUP_BOUND: Duration = Duration::from_millis(200);
 /// ±200 ppm is ±0.6 ms of buffer skew — negligible and self-corrected
 /// once the tracker engages.
 const DRIFT_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// EMA smoothing factor for the receiver's drift-tracker fill
+/// signal. The raw jitter-buffer fill oscillates ±10–30 ms with
+/// packet-arrival burstiness; α = 0.03 at ~10 ms callbacks gives
+/// τ ≈ 330 ms so the regression sees the mean fill, not the
+/// sawtooth (the same treatment as the sender's capture ring).
+const DRIFT_EMA_ALPHA: f64 = 0.03;
+
+/// Reset the receiver's drift tracker when the raw fill jumps by
+/// more than this between callbacks. The sender's bounded catch-up
+/// burst-sends up to 200 ms of packets in a few ms; the fill step
+/// would otherwise dominate the regression window for its full
+/// duration and slam the correction into the ±150 clamp (observed
+/// on the LAN: ppm pinned at +150 for ~10 s after a burst, then
+/// flipping to −87). 30 ms sits above the steady-state jitter and
+/// below the smallest meaningful burst. Mirrors the sender-side
+/// stall-cliff reset.
+const DRIFT_BURST_RESET_MS: u64 = 30;
 
 /// Receiver pipeline. Bounded to a single, default output device for
 /// v1.
@@ -1072,6 +1217,8 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         let jb_stats = state.jb.stats();
         if jb_stats.underrun_resyncs != state.last_underrun_count {
             state.drift_tracker.reset();
+            state.drift_ema.reset();
+            state.last_raw_queued = None;
             state.last_underrun_count = jb_stats.underrun_resyncs;
         }
         let skip_drift = jb_stats.latency_trims != state.last_trim_count;
@@ -1091,9 +1238,35 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
         // stays cold (is_warmed_up false) so no correction is
         // applied and the resampler remains in passthrough.
         let settled = state.created_at.elapsed() >= DRIFT_SETTLE_DELAY;
-        if !skip_drift && settled {
+        if settled {
             let qf = state.jb.queued_frames();
-            state.drift_tracker.update(qf);
+            // Burst guard (sender mirror): when the raw fill jumps
+            // by far more than the steady-state oscillation (sender
+            // burst-send, or a large cpal callback draining the
+            // buffer in one call), the step would dominate the
+            // regression window for its full duration and slam the
+            // correction into the ±150 clamp. Reset the tracker so
+            // it re-learns on the post-burst signal; the
+            // proportional term holds the fill meanwhile.
+            if let Some(prev) = state.last_raw_queued {
+                if teehee::clock_drift::fill_jump_ms(
+                    prev,
+                    qf,
+                    state.input_rate_hz,
+                    state.input_channels,
+                ) > DRIFT_BURST_RESET_MS
+                {
+                    state.drift_tracker.reset();
+                    state.drift_ema.reset();
+                }
+            }
+            state.last_raw_queued = Some(qf);
+            // EMA-smooth before feeding the tracker (see
+            // DRIFT_EMA_ALPHA).
+            let smoothed = state.drift_ema.update(qf as f64);
+            if !skip_drift {
+                state.drift_tracker.update(smoothed as usize);
+            }
         }
         // Once the tracker has enough data (~500 ms), apply drift
         // correction every callback. The resampler runs at nominal
@@ -1291,10 +1464,17 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         } else {
                             0
                         };
-                        let drift_tracker = ClockDriftTracker::new(
+                        // 30 s regression window: the jitter-buffer
+                        // fill carries arrival-burstiness wander at
+                        // 10–30 s periods that the 8 s default reads
+                        // as false slope (observed: ppm limit-cycling
+                        // between the ±150 clamps). Same treatment
+                        // as the sender's capture ring.
+                        let drift_tracker = ClockDriftTracker::with_window(
                             sent_rate,
                             prebuffer_target_frames.max(1),
                             sent_ch,
+                            30.0,
                         );
                         *state_guard = Some(RxState {
                             jb,
@@ -1306,6 +1486,8 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             last_underrun_count: 0,
                             last_trim_count: 0,
                             created_at: Instant::now(),
+                            drift_ema: Ema::new(DRIFT_EMA_ALPHA),
+                            last_raw_queued: None,
                         });
                         info!(
                             sender_sample_rate = sent_rate,
@@ -1388,10 +1570,11 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 pkt.channels,
                                 cfg.channels as u8,
                             );
-                            let drift_tracker = ClockDriftTracker::new(
+                            let drift_tracker = ClockDriftTracker::with_window(
                                 pkt.sample_rate,
                                 prebuffer_target_frames.max(1),
                                 pkt.channels,
+                                30.0,
                             );
                             *state = RxState {
                                 jb,
@@ -1403,6 +1586,8 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 last_underrun_count: 0,
                                 last_trim_count: 0,
                                 created_at: Instant::now(),
+                                drift_ema: Ema::new(DRIFT_EMA_ALPHA),
+                                last_raw_queued: None,
                             };
                         }
                     }

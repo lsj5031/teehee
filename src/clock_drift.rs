@@ -1,11 +1,31 @@
-//! `clock_drift` — adaptive clock-drift compensation for the teehee
-//! receive path.
+//! `clock_drift` — adaptive clock-drift compensation for teehee.
 //!
-//! Sender and receiver audio crystals differ by ±50–200 ppm. When
-//! nominal rates match (both 48 kHz), the resampler is bypassed and
-//! drift accumulates silently: sender-faster → buffer grows → periodic
-//! packet-skip clicks; receiver-faster → buffer drains → underrun
-//! freeze + full prebuffer re-fill (~200 ms silence).
+//! Two uses:
+//!
+//! * **Receive path** (the original use). Sender and receiver audio
+//!   crystals differ by ±50–200 ppm. When nominal rates match (both
+//!   48 kHz), the resampler is bypassed and drift accumulates
+//!   silently: sender-faster → buffer grows → periodic packet-skip
+//!   clicks; receiver-faster → buffer drains → underrun freeze +
+//!   full prebuffer re-fill (~200 ms silence). The tracker measures
+//!   the jitter-buffer fill slope and feeds a ppm correction to the
+//!   [`LinearResampler`]'s step size.
+//!
+//! * **Send path** (sender-side drift compensation). The encode loop
+//!   paces by the *wall clock*, but the capture device delivers on
+//!   its own clock (±10–200 ppm vs nominal). With wall-clock-only
+//!   pacing the capture ring has no restoring force: a capture clock
+//!   faster than the wall clock leaks ring fill upward (delay grows
+//!   for hours until the drop-oldest cap causes audible skips), and
+//!   a slower capture clock drains the ring to empty so pops fail
+//!   and the sender emits silence chunks (micro-dropouts). The same
+//!   tracker measures the capture-ring fill slope and nudges the
+//!   inter-packet pacing period (see [`period_for_ppm`]) so the ring
+//!   converges to a small target fill and stays there.
+//!
+//! The algorithm is identical for both paths; only the caller's use
+//! of `current_ppm()` differs: the receiver adjusts the resampler
+//! step, the sender adjusts the pacing period.
 //!
 //! This module tracks the jitter-buffer fill level over a sliding
 //! window, computes the fill slope via least-squares linear regression,
@@ -65,7 +85,7 @@
 //! needed.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum absolute drift correction in ppm. Real sender/receiver
 /// crystal skew on a LAN is ±50–200 ppm; the previous ±500 bound
@@ -110,6 +130,68 @@ const MIN_SAMPLES: usize = 50;
 /// the proportional term alone.
 const DEFAULT_KP: f32 = 0.08;
 
+/// Convert a base pacing period to the corrected period for a drift
+/// correction of `ppm` parts per million.
+///
+/// Sign convention matches [`ClockDriftTracker`]: positive `ppm`
+/// means the capture clock is faster than the wall clock (the
+/// capture ring is growing), so the sender must drain faster — the
+/// period shrinks. Negative `ppm` lengthens it. The clamp is a
+/// safety net only; [`MAX_DRIFT_PPM`] (±150) bounds the real
+/// correction, so the factor stays within 0.99985–1.00015.
+pub fn period_for_ppm(base: Duration, ppm: f32) -> Duration {
+    let factor = (1.0 - ppm as f64 / 1_000_000.0).clamp(0.5, 1.5);
+    base.mul_f64(factor)
+}
+
+/// Convert a raw buffer-fill jump (interleaved samples) to
+/// milliseconds of audio. Used by the receiver's burst guard to
+/// decide whether a fill change between callbacks is a sender
+/// burst (reset the tracker) or normal arrival/drain jitter.
+pub fn fill_jump_ms(prev: usize, cur: usize, rate_hz: u32, channels: u8) -> u64 {
+    if rate_hz == 0 || channels == 0 {
+        return 0;
+    }
+    let jump = prev.abs_diff(cur) as u64;
+    jump * 1000 / (rate_hz as u64 * channels as u64)
+}
+
+/// Tiny exponential moving average for smoothing a noisy fill
+/// signal before it reaches the drift regression. Both the sender
+/// (capture-ring depth) and the receiver (jitter-buffer fill) feed
+/// their raw fill through one of these so the least-squares
+/// regression sees the mean fill rather than the arrival/delivery
+/// sawtooth. Unset until the first sample; [`Ema::reset`] forgets
+/// history (used on pause, underrun, and burst resets).
+pub struct Ema {
+    alpha: f64,
+    value: Option<f64>,
+}
+
+impl Ema {
+    /// Create a fresh (unset) EMA. `alpha` is the per-update
+    /// smoothing factor: time constant ≈ `1/alpha` updates
+    /// (e.g. 0.01 at 333 Hz ≈ 300 ms; 0.03 at 100 Hz ≈ 330 ms).
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha, value: None }
+    }
+
+    /// Fold `x` into the average and return the smoothed value.
+    pub fn update(&mut self, x: f64) -> f64 {
+        self.value = Some(match self.value {
+            Some(v) => v * (1.0 - self.alpha) + x * self.alpha,
+            None => x,
+        });
+        self.value.unwrap()
+    }
+
+    /// Forget history; the next [`Ema::update`] re-initializes on
+    /// the new signal level.
+    pub fn reset(&mut self) {
+        self.value = None;
+    }
+}
+
 /// A single measurement point: elapsed time since tracker creation
 /// and the jitter-buffer fill at that instant, in *audio frames*
 /// (not interleaved samples — see [`ClockDriftTracker::update`]).
@@ -152,7 +234,7 @@ pub struct ClockDriftTracker {
 }
 
 impl ClockDriftTracker {
-    /// Create a new tracker.
+    /// Create a new tracker with the default 8-second window.
     ///
     /// * `nominal_rate` — sender's sample rate in Hz (e.g. 48000).
     /// * `target_frames` — prebuffer target in interleaved samples
@@ -161,12 +243,29 @@ impl ClockDriftTracker {
     /// * `channels` — sender channel count (e.g. 2 for stereo).
     ///   Used to normalise interleaved samples → audio frames.
     pub fn new(nominal_rate: u32, target_frames: usize, channels: u8) -> Self {
+        Self::with_window(nominal_rate, target_frames, channels, DEFAULT_WINDOW_SECS)
+    }
+
+    /// Create a tracker with a caller-chosen sliding window.
+    ///
+    /// The sender uses a 30-second window: its fill signal (the
+    /// capture ring) carries batch-delivery wander at 10–30 s
+    /// periods that an 8-second regression window would chase as
+    /// false slope (observed: ±100 ppm limit-cycle at the receiver's
+    /// default window). The receiver keeps the 8-second default —
+    /// its jitter-buffer fill signal is far cleaner.
+    pub fn with_window(
+        nominal_rate: u32,
+        target_frames: usize,
+        channels: u8,
+        window_secs: f64,
+    ) -> Self {
         let ch = channels.max(1) as f64;
         Self {
             samples: VecDeque::with_capacity(1024),
             origin: Instant::now(),
             origin_set: false,
-            window_secs: DEFAULT_WINDOW_SECS,
+            window_secs,
             nominal_rate,
             target_frames: target_frames as f64 / ch,
             channels: channels.max(1),
@@ -315,6 +414,101 @@ mod unit {
         // mono (channels=1) so samples == frames and existing
         // numeric assertions stay valid.
         ClockDriftTracker::new(48_000, target, 1)
+    }
+
+    // ── period_for_ppm ──────────────────────────────────────────
+
+    #[test]
+    fn period_for_ppm_zero_is_identity() {
+        let base = Duration::from_millis(3);
+        assert_eq!(period_for_ppm(base, 0.0), base);
+    }
+
+    #[test]
+    fn period_for_ppm_positive_speeds_up() {
+        // Ring growing (capture fast) → positive ppm → shorter period.
+        let base = Duration::from_millis(3);
+        let p = period_for_ppm(base, 100.0);
+        assert!(p < base, "positive ppm must shrink the period");
+        // 3 ms × (1 − 100e-6) = 2 999 700 ns.
+        assert_eq!(p.as_nanos(), 2_999_700);
+    }
+
+    #[test]
+    fn period_for_ppm_negative_slows_down() {
+        // Ring draining (capture slow) → negative ppm → longer period.
+        let base = Duration::from_millis(3);
+        let p = period_for_ppm(base, -100.0);
+        assert!(p > base, "negative ppm must lengthen the period");
+        assert_eq!(p.as_nanos(), 3_000_300);
+    }
+
+    #[test]
+    fn period_for_ppm_at_clamp_bounds() {
+        let base = Duration::from_millis(3);
+        // ±150 ppm is the tracker clamp; the correction must stay
+        // tiny (0.015 %) — no gross rate swing.
+        let fast = period_for_ppm(base, 150.0);
+        let slow = period_for_ppm(base, -150.0);
+        let span = slow.as_nanos() - fast.as_nanos();
+        assert_eq!(span, 900, "±150 ppm is a ±450 ns change at 3 ms");
+    }
+
+    // ── Ema ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ema_initializes_on_first_sample() {
+        let mut e = Ema::new(0.5);
+        assert_eq!(e.update(42.0), 42.0, "first sample seeds the EMA");
+    }
+
+    #[test]
+    fn ema_smooths_toward_the_mean() {
+        let mut e = Ema::new(0.5);
+        e.update(0.0);
+        // 0.5×0 + 0.5×10 = 5, then 0.5×5 + 0.5×10 = 7.5 …
+        assert_eq!(e.update(10.0), 5.0);
+        assert_eq!(e.update(10.0), 7.5);
+        assert_eq!(e.update(10.0), 8.75);
+    }
+
+    #[test]
+    fn ema_reset_forgets_history() {
+        let mut e = Ema::new(0.5);
+        e.update(100.0);
+        e.update(100.0);
+        e.reset();
+        assert_eq!(
+            e.update(0.0),
+            0.0,
+            "after reset the next sample seeds fresh, no carry-over"
+        );
+    }
+
+    // ── fill_jump_ms ────────────────────────────────────────────
+
+    #[test]
+    fn fill_jump_ms_converts_samples_to_ms() {
+        // 48 kHz stereo: 9600 samples = 100 ms of audio.
+        assert_eq!(fill_jump_ms(0, 9600, 48_000, 2), 100);
+        // Same fill → 0 ms.
+        assert_eq!(fill_jump_ms(9600, 9600, 48_000, 2), 0);
+    }
+
+    #[test]
+    fn fill_jump_ms_is_direction_agnostic() {
+        // A burst (fill up) and a drain cliff (fill down) of the
+        // same size must produce the same jump.
+        assert_eq!(fill_jump_ms(9600, 19_200, 48_000, 2), 100);
+        assert_eq!(fill_jump_ms(19_200, 9600, 48_000, 2), 100);
+    }
+
+    #[test]
+    fn fill_jump_ms_respects_rate_and_channels() {
+        // Mono 44.1 kHz: 4410 samples = 100 ms.
+        assert_eq!(fill_jump_ms(0, 4410, 44_100, 1), 100);
+        // Zero rate/channels: no meaningful conversion, no panic.
+        assert_eq!(fill_jump_ms(0, 100, 0, 0), 0);
     }
 
     #[test]
