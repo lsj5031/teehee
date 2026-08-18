@@ -64,7 +64,8 @@ runtime, no Python, no PortAudio, no installer.
 events and periodic `recv_stats` / `send_stats` records — ideal for Task
 Scheduler deploys where console output is discarded. Example fields:
 `queued_ms` (live playout delay), `latency_trims`, `capture_ring_ms`,
-`capture_overruns`. Use with or without `--stats` (console tracing).
+`capture_overruns`, `send_drift_ppm`. Use with or without `--stats`
+(console tracing).
 
 `--prebuffer-ms` (slice 6) is the *gate*: the receiver waits in
 silence until at least this many ms of audio have accumulated in
@@ -114,11 +115,41 @@ packet rate. Default format is 48 kHz stereo f32.
 
 `--capture-buffer-ms` (default `200`) caps the sender’s capture PCM
 ring. If capture briefly outruns encode (loopback burst after idle,
-scheduling stall), the ring **drop-oldest**s and the encode loop
-**catch-up**s (sends without inter-packet sleep until only one chunk
-remains). Watch `capture_ring_ms` / `capture_overruns` on `--stats` or
-in the JSONL log — a permanently high `capture_ring_ms` was the main
-cause of “receiver lag” before this fix.
+scheduling stall), the ring **drop-oldest**s so playback never plays
+stale audio.
+
+The sender clock-locks its encode loop to the capture ring. A drift
+compensator (the sender-side mirror of the receiver’s `drift_ppm`)
+measures the ring-fill slope over a 30-second sliding window (the
+same window both sides use — capture and jitter-buffer fills both
+carry low-frequency wander that an 8-second regression would read as
+false slope) and nudges the inter-packet pacing period by ±ppm so
+the ring converges to a small target fill (at least 2 chunks, min
+15 ms) and stays there. This closes the two failure modes of
+wall-clock-only pacing:
+
+* **Capture clock faster than the wall clock** — the ring used to
+  leak upward at the clock skew (e.g. +12 ppm ≈ +0.012 ms/s ≈
+  +260 ms of delay over a 6-hour session), until it hit the
+  `--capture-buffer-ms` cap and drop-oldest caused audible skips.
+  Now the sender drains faster and the ring stays at the target.
+* **Capture clock slower than the wall clock** — the ring used to
+  drain to empty, pops failed, and the sender emitted silence
+  chunks (periodic micro-dropouts). Now the sender slows to match
+  and pops never starve.
+
+After a scheduling stall longer than 200 ms, the pacer burst-sends up
+to 200 ms of backlog (real audio only, bounded so the receiver’s
+jitter buffer is never flooded) so the ring recovers quickly instead
+of ratcheting toward the cap; any residue is drained by the drift
+compensator. Watch `capture_ring_ms` / `capture_overruns` /
+`send_drift_ppm` on `--stats` or in the JSONL log. `send_drift_ppm`
+is the applied pacing correction: near 0 means the capture clock
+matches the wall clock; ±50–200 is typical device skew; ±150 (the
+clamp) means the tracker is saturating — usually right after a stall
+or long pause, and it recovers. A permanently high `capture_ring_ms`
+now means the machine is CPU-starved (the encode loop is being
+preempted), not clock drift.
 
 `--sample-rate` and `--channels` control the format for `--sine` dry-run
 mode only. For real capture (no `--sine`), the cpal / WASAPI device's
@@ -614,7 +645,14 @@ drift accumulates silently: sender-faster → buffer grows → periodic
 packet-skip clicks; receiver-faster → buffer drains → underrun
 freeze + full prebuffer re-fill (~200 ms silence).
 
-The receiver now tracks the jitter-buffer fill level over an 8-second
+The receiver tracks the jitter-buffer fill level and corrects its
+resampler. The sender has its own compensator (see
+`--capture-buffer-ms` above): it tracks the capture-ring fill and
+corrects its pacing period, so the sender's packet rate tracks the
+capture device's clock — the receiver only ever sees the residual
+mismatch, which its own tracker absorbs.
+
+The receiver now tracks the jitter-buffer fill level over a 30-second
 sliding window, computes the fill slope via least-squares linear
 regression, and derives a rate-correction factor (`drift_ppm`) that
 nudges the resampler's step size to keep the buffer at its target
@@ -624,21 +662,31 @@ fill. Two terms contribute:
   correction is `(m / nominal_rate) × 1 000 000` ppm. This directly
   counteracts the crystal skew.
 * **Proportional term** — gently pulls the buffer back toward the
-  prebuffer target. Gain `kp = 0.2` (10× the initial 0.02) gives a
-  time constant of ≈ 104 s at 48 kHz; 95 % settled in ≈ 5 min.
+  prebuffer target. Gain `kp = 0.08` gives a time constant of
+  ≈ 260 s at 48 kHz; 95 % settled in ≈ 13 min.
 
 Both terms are normalised to *audio frames* (interleaved samples ÷
 channel count) so the correction is channel-count–agnostic — stereo
 and mono streams produce the same ppm for the same fill drift.
-The total correction is clamped to ±500 ppm (0.05 % step change —
-inaudible per callback).
+The total correction is clamped to ±150 ppm (0.015 % step change —
+inaudible per callback) and slew-limited to 0.5 ppm per callback.
+
+The fill signal is EMA-smoothed (τ ≈ 330 ms) before the regression
+so packet-arrival burstiness is not read as false slope, and the
+tracker resets when the raw fill jumps by more than 30 ms between
+callbacks — a sender burst (the sender's bounded catch-up delivers
+up to 200 ms of packets at once) or a large callback drain — or on
+underrun. Without the burst reset, a one-off fill step pins the
+correction at the clamp for the whole window and then overshoots
+(observed on the LAN: `drift_ppm` pinned at +150 for ~10 s after a
+burst, then flipping to −87).
 
 On `--stats`, watch:
 
 * `drift_ppm` — the applied correction. Near 0 means crystals are
-  matched; ±50–200 is typical LAN drift. ±500 (the clamp) means the
-  tracker is saturating — likely a long pause or burst, not real
-  skew; it will recover.
+  matched; ±50–200 is typical LAN drift. ±150 (the clamp) means the
+  tracker is saturating — likely right after a burst, stall, or
+  long pause, not real skew; it recovers.
 * `drift_slope` — the raw fill slope in frames/sec. Positive =
   buffer growing (sender faster); negative = draining (receiver
   faster).
