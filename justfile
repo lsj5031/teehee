@@ -32,6 +32,16 @@ clippy:
 check:
     cargo check --workspace
 
+# Alert on sender trouble by tailing logs/send.jsonl (ring fill,
+# drift saturation, dead sender)
+watch-send:
+    bash scripts/send_watch.sh
+
+# Launch/keep-alive the sender in the foreground (logs/supervisor.log);
+# designed to run at logon via the TeeHeeSender scheduled task
+supervisor:
+    bash scripts/send_supervisor.sh
+
 # Run the full CI suite locally (fmt + clippy + test)
 ci: lint test
 
