@@ -180,8 +180,10 @@ impl Packet {
     /// Iterate the decoded payload as `f32` samples.
     pub fn pcm_f32(&self) -> impl Iterator<Item = f32> + '_ {
         self.payload
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
     }
 
     /// Append the decoded payload as `f32` samples to a caller-owned
@@ -192,8 +194,8 @@ impl Packet {
     pub fn pcm_f32_into(&self, out: &mut Vec<f32>) {
         out.clear();
         out.reserve(self.payload.len() / 4);
-        for c in self.payload.chunks_exact(4) {
-            out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        for c in self.payload.as_chunks::<4>().0 {
+            out.push(f32::from_le_bytes(*c));
         }
     }
 
