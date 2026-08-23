@@ -2,3 +2,8 @@
 teehee.zip
 /logs/
 .freebuff/
+# local photo-organize helper (not part of teehee)
+organize.py
+organize_run.log
+organized_photos/
+manifest.csv
