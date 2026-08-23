@@ -621,11 +621,14 @@ self-heals within ~2 min, so stats older than 4 min mean self-healing
 has failed and the operator should look (`schtasks /run /tn
 TeeHeeSender` starts it manually).
 
-The `TeeHeeWatch` task runs `powershell.exe -NoProfile -ExecutionPolicy
-Bypass -File T:\TeeHee\scripts\send_watch.ps1 -Check` every 5 minutes.
-It is PowerShell, not bash — Git Bash cannot be launched from Task
-Scheduler (the reason the sender task runs the exe directly), and
-PowerShell is native and task-launchable.
+The `TeeHeeWatch` task runs `wscript.exe
+T:\TeeHee\scripts\send_watch_task.vbs` every 5 minutes. The VBScript
+launcher starts `send_watch.ps1 -Check` with `windowStyle 0` and waits
+for it, so neither the launcher nor PowerShell can flash a console
+window in the interactive session. It is PowerShell, not bash — Git
+Bash cannot be launched from Task Scheduler (the reason the sender
+task runs the exe directly), and PowerShell is native and
+task-launchable.
 
 For a manual foreground run of the sender (debugging), `just sender`
 runs the same command as the task.
