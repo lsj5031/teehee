@@ -32,15 +32,18 @@ clippy:
 check:
     cargo check --workspace
 
-# Alert on sender trouble by tailing logs/send.jsonl (ring fill,
-# drift saturation, dead sender)
+# Alert on sender trouble (ring fill, drift saturation, dead sender).
+# Interactive foreground watcher; the TeeHeeWatch scheduled task runs
+# the same script in -Check mode every 5 min.
 watch-send:
-    bash scripts/send_watch.sh
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/send_watch.ps1
 
-# Launch/keep-alive the sender in the foreground (logs/supervisor.log);
-# designed to run at logon via the TeeHeeSender scheduled task
-supervisor:
-    bash scripts/send_supervisor.sh
+# Run the sender in the foreground (same args as the TeeHeeSender
+# scheduled task, which runs teehee.exe directly — no supervisor).
+# For manual runs / debugging; the task self-heals via its 2-min
+# periodic trigger + the sender's single-instance mutex guard.
+sender:
+    ./target/release/teehee.exe send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file logs/send.jsonl --capture-buffer-ms 400
 
 # Run the full CI suite locally (fmt + clippy + test)
 ci: lint test

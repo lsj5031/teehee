@@ -122,6 +122,51 @@ impl Drop for HighResTimer {
     }
 }
 
+/// Windows-only single-instance guard for the `send` subcommand.
+///
+/// A named mutex is the native Windows equivalent of the old bash
+/// supervisor's `kill_stale_senders` + pid-file singleton: if another
+/// `teehee send` is already running, this process exits immediately
+/// with a clear message instead of double-streaming audio. Unlike a
+/// pid file, the kernel destroys the mutex object when the owning
+/// process exits, so a crashed sender never leaves a stale lock
+/// behind — the next launch simply takes ownership.
+struct SingleInstanceGuard {
+    #[cfg(target_os = "windows")]
+    _handle: windows::Win32::Foundation::HANDLE,
+}
+
+impl SingleInstanceGuard {
+    #[cfg(target_os = "windows")]
+    fn acquire(name: &str) -> anyhow::Result<Self> {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
+
+        let wide = HSTRING::from(name);
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }?;
+        // CreateMutexW succeeds with a VALID handle even when the named
+        // mutex already exists — it signals that case via
+        // ERROR_ALREADY_EXISTS in the last error, not via a NULL return.
+        // Check immediately (no FFI calls in between, so the last-error
+        // value is still intact).
+        let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        if already_exists {
+            let _ = unsafe { CloseHandle(handle) };
+            anyhow::bail!(
+                "another teehee send instance is already running \
+                 (single-instance mutex '{name}'); exiting"
+            );
+        }
+        Ok(Self { _handle: handle })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn acquire(_name: &str) -> anyhow::Result<Self> {
+        Ok(Self {})
+    }
+}
+
 struct SendPacer {
     period: Duration,
     next_tick: Instant,
@@ -230,6 +275,13 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // Windows: request 1 ms timer resolution for accurate send
     // pacing. Dropped (timeEndPeriod) automatically on return.
     let _timer = HighResTimer::acquire();
+
+    // Single-instance guard: refuse to run a second `teehee send`
+    // concurrently (a duplicate would double the audio stream and
+    // corrupt send.jsonl). The named mutex is scoped to this logon
+    // session (Local\), and is destroyed by the kernel when the
+    // owning process exits — so a crash never leaves a stale lock.
+    let _single_instance = SingleInstanceGuard::acquire("Local\\TeeHeeSend")?;
 
     // Validate parses positional vs --host and `host:port` ↔ `--port`
     // collisions BEFORE we open any cpal stream or socket; this keeps

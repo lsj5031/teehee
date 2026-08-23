@@ -451,6 +451,185 @@ receiver on a single machine, or to run the localhost smoke test:
 You should see the sender log ~50 packets/sec and the receiver log
 `late_drops=0 duplicates=0 silence_insertions=0` every second.
 
+## Windows deployment (scheduled task)
+
+For a persistent sender that survives reboots and self-heals after a
+crash, run `teehee.exe` **directly** from a Task Scheduler task — no
+bash supervisor, no pid files, no third-party service wrapper. This is
+the supported way to deploy the sender on Windows.
+
+Why not a Windows service? WASAPI loopback capture is *session-bound*:
+it captures the audio rendered in the interactive logon session. A
+service runs in session 0, so it would start cleanly but capture
+silence. Task Scheduler's at-logon trigger runs the task in your
+session — exactly where loopback audio lives. Why not a bash
+supervisor? MSYS2/Git-Bash cannot be launched reliably from Task
+Scheduler's context (the shell dies at DLL-init with exit code 1), and
+a shell loop with pid files and kill-by-name is fragile under system
+resource pressure. The OS already provides supervision primitives; the
+task below is all of them, configured.
+
+### The `TeeHeeSender` task
+
+| Setting | Value | Why |
+|---|---|---|
+| Action | `T:\TeeHee\target\release\teehee.exe send --host <mac-ip> --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 400` | The sender is a long-running loop; it needs no supervisor. `--log-file` is what makes a headless task observable (console output is discarded). |
+| Trigger | At logon | Interactive session → WASAPI loopback works. |
+| Trigger | Every 2 minutes (repeating) | Self-heal: if the sender is dead, the next firing restarts it within 2 minutes. |
+| Multiple instances | `IgnoreNew` | A firing while the sender is alive is skipped — never a duplicate stream. |
+| Execution time limit | Disabled (`PT0S`) | A long-running task must not be killed after 72 h. |
+| Start on battery | Allowed | A laptop at logon on battery must still start. |
+| Restart on failure | Every 1 min, up to 3× | Bonus; see the caveat below. |
+
+### Single-instance guard
+
+`teehee send` holds a named mutex (`Local\TeeHeeSend`). A second
+`teehee send` exits immediately with:
+
+```
+Error: another teehee send instance is already running (single-instance mutex 'Local\TeeHeeSend'); exiting
+```
+
+The kernel destroys the mutex when the owning process exits, so a
+crash never leaves a stale lock — the next launch (or the 2-minute
+trigger) simply takes ownership. This is the native replacement for
+the old supervisor's kill-stale-senders + pid-file logic.
+
+### Re-registering the task
+
+Root-folder task registration requires an **elevated** prompt. Save
+this XML (adjust the `UserId`/SID, paths, and host to your machine),
+then:
+
+```powershell
+schtasks /create /tn TeeHeeSender /xml "C:\path\to\teehee_task.xml" /f
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>MERCURY\lsj50</Author>
+    <Description>teehee sender; runs teehee.exe directly (no bash supervisor). Self-heals via 2-min trigger + restart-on-failure.</Description>
+    <URI>\TeeHeeSender</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1767847710-1798288265-1333515972-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <RestartOnFailure>
+      <Count>3</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <UserId>MERCURY\lsj50</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>2026-08-23T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT2M</Interval>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>T:\TeeHee\target\release\teehee.exe</Command>
+      <Arguments>send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 400</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+To get your user's SID for the `<UserId>` element (or to confirm the
+task runs as you): `whoami /user`. The `StartBoundary` of the
+repeating trigger is when the 2-minute cadence anchors; it repeats
+indefinitely (no `Duration` = never stops).
+
+### Verifying
+
+```powershell
+schtasks /query /tn TeeHeeSender /v /fo LIST
+# Status: Running, Last Result: 267009 (SCHED_S_TASK_RUNNING) — healthy
+
+tasklist | findstr teehee
+# teehee.exe ...
+
+# Sender health lives in the JSONL log (one send_stats line per second):
+Get-Content T:\TeeHee\logs\send.jsonl -Tail 1
+```
+
+`Last Result 267009` while running is healthy; `1` means the last
+start failed (check the exe path and the log). While the task is
+running, an *ignored* 2-minute firing can surface
+`SCHED_E_USER_NOT_LOGGED_ON` (`0x80041320`) as the last result — that
+is cosmetic (the firing was skipped because the task was already
+running) and clears on the next real start.
+
+Task lifecycle events — start, fail, restart, and skipped (already
+running) firings — are recorded in the
+`Microsoft-Windows-TaskScheduler/Operational` event log (enabled):
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddMinutes(-10)} |
+  Where-Object { $_.Message -match 'TeeHee' } | Format-List TimeCreated, Id, Message
+```
+
+### Caveat: Restart on failure
+
+Task Scheduler's "Restart on failure" does **not** fire for
+run-only-when-logged-on (`InteractiveToken`) tasks — a documented
+limitation. The 2-minute periodic trigger is the real self-heal
+mechanism and is verified to restart a killed sender within 2 minutes.
+The `RestartOnFailure` setting is kept as a harmless bonus.
+
+### Monitoring and alerting
+
+`logs/send.jsonl` is the monitoring surface: `send_start` on launch,
+then a `send_stats` record every second with `packets_sent`,
+`packets_per_sec`, `send_errors`, `capture_ring_ms`, and
+`send_drift_ppm`.
+
+`scripts/send_watch.ps1` is the operator's single alerting entry
+point, with two modes:
+
+* `-Watch` (default) — interactive foreground watcher: polls
+  `send.jsonl` every 10 s and alerts on state transitions (ring fill,
+  drift saturation, silent sender). Run via `just watch-send`.
+* `-Check` — one-shot health check for the `TeeHeeWatch` scheduled
+  task (every 5 min). Alerts only on NEW problems and recoveries
+  (state kept in `logs/send_watch.state`), so a stuck sender alerts
+  once, not every 5 minutes.
+
+Alerts append a timestamped line to `logs/send_alerts.log`, play an
+audible alert, and (in `-Check` mode) best-effort pop a message box.
+The "sender down" check uses a 240 s stale threshold: the sender task
+self-heals within ~2 min, so stats older than 4 min mean self-healing
+has failed and the operator should look (`schtasks /run /tn
+TeeHeeSender` starts it manually).
+
+The `TeeHeeWatch` task runs `powershell.exe -NoProfile -ExecutionPolicy
+Bypass -File T:\TeeHee\scripts\send_watch.ps1 -Check` every 5 minutes.
+It is PowerShell, not bash — Git Bash cannot be launched from Task
+Scheduler (the reason the sender task runs the exe directly), and
+PowerShell is native and task-launchable.
+
+For a manual foreground run of the sender (debugging), `just sender`
+runs the same command as the task.
+
 ## Firewall configuration
 
 v1 sends **UDP only**, port `5000` by default. Both sides need the port
