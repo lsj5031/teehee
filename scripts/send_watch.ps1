@@ -71,6 +71,21 @@ if ($Check) {
 }
 $TAIL_LINES = 5000
 
+# Heartbeat: every run (Check or Watch) touches this file with a UTC
+# unix timestamp. The separate watchdog (send_watchdog.ps1, TeeHeeWatchdog
+# scheduled task) alerts if this file goes stale - that means THIS task
+# (TeeHeeWatch) stopped running and nothing is watching the sender.
+$heartbeatFile = Join-Path $root 'logs\send_watch.heartbeat'
+
+function Write-Heartbeat {
+    # Called by every run (-Check or -Watch) so the watchdog can tell
+    # "watcher alive" from "watcher dead". The TeeHeeWatchdog scheduled
+    # task alerts if this file goes stale.
+    try {
+        Set-Content -Path $heartbeatFile -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii
+    } catch {}
+}
+
 # --- helpers ---------------------------------------------------------
 function Write-Alert([string]$msg) {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -150,6 +165,7 @@ function Get-RecoveryMessage([string]$name) {
 # One-shot health check (scheduled task mode): alert on new problems,
 # log recoveries, persist state so a problem alerts only once.
 function Invoke-Check {
+    Write-Heartbeat
     $snap = Read-LogSnapshot
     $active = @(Get-Conditions $snap)
 
@@ -181,6 +197,7 @@ function Invoke-Watch {
         Write-Host "send_watch: log not found: $Log" -ForegroundColor Red
         exit 1
     }
+    Write-Heartbeat
     $prev = @{}
     while ($true) {
         $snap = Read-LogSnapshot
@@ -197,6 +214,7 @@ function Invoke-Watch {
             }
         }
         $prev = $activeSet
+        Write-Heartbeat
         Start-Sleep -Seconds $POLL_SECS
     }
 }
