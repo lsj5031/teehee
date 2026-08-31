@@ -78,9 +78,6 @@ $TAIL_LINES = 5000
 $heartbeatFile = Join-Path $root 'logs\send_watch.heartbeat'
 
 function Write-Heartbeat {
-    # Called by every run (-Check or -Watch) so the watchdog can tell
-    # "watcher alive" from "watcher dead". The TeeHeeWatchdog scheduled
-    # task alerts if this file goes stale.
     try {
         Set-Content -Path $heartbeatFile -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii
     } catch {}

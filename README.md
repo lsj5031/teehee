@@ -633,6 +633,66 @@ task-launchable.
 For a manual foreground run of the sender (debugging), `just sender`
 runs the same command as the task.
 
+### Scheduled task installation
+
+All three monitoring tasks use VBScript launchers (`*.vbs`) so that
+neither the launcher nor PowerShell flashes a console window in the
+interactive session. Register them from an **elevated** prompt once
+per machine:
+
+```powershell
+# TeeHeeWatch: runs send_watch.ps1 -Check every 5 min (sender health)
+just install-watch
+
+# TeeHeeWatchdog: runs send_watchdog.ps1 every 10 min (watcher health)
+just install-watchdog
+
+# TeeHeeRotate: runs rotate_logs.ps1 daily (log size cap + archive prune)
+just install-rotate
+```
+
+Tasks run as the **installing user** with highest privileges (`/RL
+HIGHEST`) — not as `SYSTEM`. This is intentional: `msg.exe` desktop
+popups and `SystemSounds` alerts require an interactive session,
+which session-0 (`SYSTEM`) would swallow.
+
+### Watchdog (watcher-of-the-watcher)
+
+`scripts/send_watchdog.ps1` is a second-line defense. If the
+`TeeHeeWatch` task itself is disabled, its trigger breaks, or
+PowerShell is broken, the sender would go unmonitored indefinitely.
+The watchdog checks `logs/send_watch.heartbeat` (written by every
+`send_watch.ps1` run) and alerts if it goes stale beyond 15 min
+(`$StaleSecs = 900`):
+
+* A **stale heartbeat** (timestamp older than 15 min) triggers an
+  alert via the same channels (alerts log, sound, msg.exe popup).
+* A **missing heartbeat** is given the same 15-min grace period
+  (anchored by a `logs/send_watchdog.grace` sentinel) so the first
+  watchdog firing — before `TeeHeeWatch` has written the heartbeat —
+  does not false-alert. After the grace window, a still-missing file
+  means `TeeHeeWatch` was never installed or has been removed.
+* A **corrupt heartbeat** (non-numeric content) is treated as stale
+  with `age=unknown`; the alert still fires.
+
+### Log rotation
+
+`scripts/rotate_logs.ps1` caps log sizes so `send.jsonl` cannot grow
+unbounded (~150 MB/month). The `TeeHeeRotate` task runs it daily:
+
+* When `logs/send.jsonl` exceeds 100 MB (`$MaxSendMb`), it is
+  **copy-and-truncated**: the contents are copied to
+  `logs/archive/send-<timestamp>.jsonl`, then the live file is
+  truncated in place. The sender holds a process-lifetime append
+  handle on `send.jsonl` and never reopens by path, so a rename would
+  send future writes into the archive and the live file would never
+  be recreated. Copy-and-truncate keeps the sender writing at the
+  live path while the archive preserves the rotated data.
+* `logs/send_alerts.log` is rotated the same way at 1 MB
+  (`$MaxAlertMb`).
+* Archives are pruned: only the 8 newest (`$KeepArchives`) are kept,
+  and anything older than 90 days (`$RetainDays`) is deleted.
+
 ## Firewall configuration
 
 v1 sends **UDP only**, port `5000` by default. Both sides need the port

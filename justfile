@@ -44,7 +44,14 @@ watch-send:
 watchdog:
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/send_watchdog.ps1
 
-# Register the TeeHeeWatchdog scheduled task (every 10 min, SYSTEM).
+# Register the TeeHeeWatch scheduled task (every 5 min, current user,
+# elevated). Runs the VBS launcher so no console window flashes.
+# Run from an elevated prompt once per machine.
+install-watch:
+    schtasks /Create /F /TN TeeHeeWatch /SC MINUTE /MO 5 /TR "wscript.exe \"{{justfile_directory()}}\scripts\send_watch_task.vbs\"" /RL HIGHEST
+
+# Register the TeeHeeWatchdog scheduled task (every 10 min, current user,
+# elevated). Alerts if the TeeHeeWatch heartbeat goes stale.
 # Run from an elevated prompt once per machine.
 install-watchdog:
     schtasks /Create /F /TN TeeHeeWatchdog /SC MINUTE /MO 10 /TR "wscript.exe \"{{justfile_directory()}}\scripts\send_watchdog_task.vbs\"" /RL HIGHEST
@@ -53,7 +60,8 @@ install-watchdog:
 rotate-logs:
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rotate_logs.ps1
 
-# Register the TeeHeeRotate scheduled task (daily, SYSTEM).
+# Register the TeeHeeRotate scheduled task (daily, current user,
+# elevated). Rotates oversized logs and prunes old archives.
 # Run from an elevated prompt once per machine.
 install-rotate:
     schtasks /Create /F /TN TeeHeeRotate /SC DAILY /MO 1 /TR "wscript.exe \"{{justfile_directory()}}\scripts\rotate_logs_task.vbs\"" /RL HIGHEST
