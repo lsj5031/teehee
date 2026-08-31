@@ -5,7 +5,7 @@ Option Explicit
 
 Dim fso, shell, scriptDir, watchdog, powershell, command, exitCode
 Set fso = CreateObject("Scripting.FileSystemObject")
-Set shell = WScript.Shell
+Set shell = CreateObject("WScript.Shell")
 
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 watchdog = fso.BuildPath(scriptDir, "send_watchdog.ps1")

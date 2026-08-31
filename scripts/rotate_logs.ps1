@@ -6,17 +6,24 @@ will eat the disk. This script runs on its own schedule (TeeHeeRotate
 scheduled task, daily) and:
 
   1. Rotates logs\send.jsonl when it exceeds MAX_SEND_MB (default 100):
-     renames it to logs\archive\send-<UTC timestamp>.jsonl. The sender
-     keeps writing to the open file handle, so rotation is safe while
-     it runs; the new file is created on the next write.
+     copies it to logs\archive\send-<UTC timestamp>.jsonl, then
+     truncates the live file to zero. The sender holds a
+     process-lifetime append handle on send.jsonl and never reopens by
+     path, so a rename would send future writes into the archive and
+     the live file would never be recreated. Copy-and-truncate keeps
+     the sender writing to the same open handle at the live path while
+     the archive preserves the rotated data.
   2. Rotates logs\send_alerts.log when it exceeds MAX_ALERT_MB
-     (default 1) the same way.
+     (default 1) the same way. (Add-Content reopens the path each
+     write, so rename would also work here, but copy-and-truncate is
+     uniform and avoids any open-handle edge case.)
   3. Prunes archives: keeps only KEEP_ARCHIVES (default 8) newest
      archived send-*.jsonl files, deletes older ones, and removes
      archive entries older than RETAIN_DAYS (default 90).
 
-Safe to run while the sender is up: renaming an open file is atomic on
-NTFS, and the sender recreates the file on its next write.
+Safe to run while the sender is up: copy-and-truncate does not close
+or move the sender's open file handle — it copies the contents to the
+archive, then truncates the live file in place.
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\rotate_logs.ps1
@@ -50,7 +57,20 @@ function Rotate-Log([string]$path, [string]$archivePrefix, [long]$maxBytes) {
     if ($size -lt $maxBytes) { return }
     $ext = if ($archivePrefix -eq 'send') { 'jsonl' } else { 'log' }
     $target = Join-Path $archiveDir "$archivePrefix-$stamp.$ext"
-    Move-Item -Path $path -Destination $target -Force
+    # Copy-Item opens the source for read (sharing the sender's append
+    # handle), then we truncate the live file in place. The sender's
+    # open handle stays valid and keeps writing at the live path.
+    Copy-Item -Path $path -Destination $target -Force
+    # Truncate: open for write (not append) with ReadWrite share so it
+    # does not conflict with the sender's open append handle, then close
+    # immediately. The sender's handle is unaffected; its next write
+    # appends to the now-empty file at the same path.
+    try {
+        $stream = [System.IO.File]::Open($path, 'Truncate', 'Write', 'ReadWrite')
+        $stream.Close()
+    } catch {
+        Write-Host "[ROTATE] WARNING: could not truncate $path - $($_.Exception.Message)"
+    }
     $displayName = if ((Get-Item $target -ErrorAction SilentlyContinue)) { (Get-Item $target).Name } else { $archivePrefix }
     Write-Host "[ROTATE] $displayName $([math]::Round($size/1MB,1)) MB -> $target"
 }

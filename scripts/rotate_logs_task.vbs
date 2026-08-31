@@ -6,7 +6,7 @@ Option Explicit
 
 Dim fso, shell, scriptDir, rotate, powershell, command, exitCode
 Set fso = CreateObject("Scripting.FileSystemObject")
-Set shell = WScript.Shell
+Set shell = CreateObject("WScript.Shell")
 
 scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
 rotate = fso.BuildPath(scriptDir, "rotate_logs.ps1")
