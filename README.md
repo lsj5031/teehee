@@ -473,7 +473,7 @@ task below is all of them, configured.
 
 | Setting | Value | Why |
 |---|---|---|
-| Action | `T:\TeeHee\target\release\teehee.exe send --host <mac-ip> --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 400` | The sender is a long-running loop; it needs no supervisor. `--log-file` is what makes a headless task observable (console output is discarded). |
+| Action | `T:\TeeHee\target\release\teehee.exe send --host <mac-ip> --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200` | The sender is a long-running loop; it needs no supervisor. `--log-file` is what makes a headless task observable (console output is discarded). |
 | Trigger | At logon | Interactive session → WASAPI loopback works. |
 | Trigger | Every 2 minutes (repeating) | Self-heal: if the sender is dead, the next firing restarts it within 2 minutes. |
 | Multiple instances | `IgnoreNew` | A firing while the sender is alive is skipped — never a duplicate stream. |
@@ -548,7 +548,7 @@ schtasks /create /tn TeeHeeSender /xml "C:\path\to\teehee_task.xml" /f
   <Actions Context="Author">
     <Exec>
       <Command>T:\TeeHee\target\release\teehee.exe</Command>
-      <Arguments>send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 400</Arguments>
+      <Arguments>send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200</Arguments>
     </Exec>
   </Actions>
 </Task>

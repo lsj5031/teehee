@@ -71,7 +71,7 @@ install-rotate:
 # For manual runs / debugging; the task self-heals via its 2-min
 # periodic trigger + the sender's single-instance mutex guard.
 sender:
-    ./target/release/teehee.exe send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file logs/send.jsonl --capture-buffer-ms 400
+    ./target/release/teehee.exe send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file logs/send.jsonl --capture-buffer-ms 1200
 
 # Run the full CI suite locally (fmt + clippy + test)
 ci: lint test

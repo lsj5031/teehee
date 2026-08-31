@@ -36,7 +36,7 @@ Checks (both modes):
         operator should look. In -Watch mode it is 20 s.
 
 The ring cap is auto-detected from the most recent `send_start`
-event's capture_buffer_ms (falls back to 400, the deployed setting).
+event's capture_buffer_ms (falls back to 1200, the deployed setting).
 
 Alerting: appends a timestamped line to logs\send_alerts.log and plays
 an audible alert. In -Check mode it also best-effort pops a message
@@ -107,7 +107,7 @@ function Write-Recovery([string]$msg) {
 # and the latest send_stats record. Returns a hashtable.
 function Read-LogSnapshot {
     $snap = @{
-        cap_ms = 400
+        cap_ms = 1200
         stats  = $null
         now    = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     }
