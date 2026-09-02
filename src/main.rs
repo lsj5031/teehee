@@ -275,6 +275,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // Windows: request 1 ms timer resolution for accurate send
     // pacing. Dropped (timeEndPeriod) automatically on return.
     let _timer = HighResTimer::acquire();
+    normalize_sender_priority();
 
     // Single-instance guard: refuse to run a second `teehee send`
     // concurrently (a duplicate would double the audio stream and
@@ -353,6 +354,12 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     // leaves them at zero (no capture ring to compensate).
     let send_drift_ppm = Arc::new(AtomicU32::new(0.0f32.to_bits()));
     let send_drift_slope = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    // Encode-loop scheduling diagnostics. A long gap means the sender
+    // was descheduled or blocked and will subsequently burst-send its
+    // capture backlog. That burst is the signature that preceded the
+    // receiver's audible latency trims.
+    let encode_stalls = Arc::new(AtomicU64::new(0));
+    let max_encode_stall_ms = Arc::new(AtomicU64::new(0));
 
     // Runtime control: TCP server on 127.0.0.1 (opt-in via --control-port).
     // Default is disabled (port 0); pass --control-port 9090 (or any
@@ -534,6 +541,8 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&capture_ring_slot),
                 Arc::clone(&send_drift_ppm),
                 Arc::clone(&send_drift_slope),
+                Arc::clone(&encode_stalls),
+                Arc::clone(&max_encode_stall_ms),
                 args.stats,
                 Arc::clone(&jsonl),
                 control.clone(),
@@ -733,6 +742,8 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 Arc::clone(&ring_slot),
                 Arc::clone(&send_drift_ppm),
                 Arc::clone(&send_drift_slope),
+                Arc::clone(&encode_stalls),
+                Arc::clone(&max_encode_stall_ms),
                 args.stats,
                 Arc::clone(&jsonl),
                 control.clone(),
@@ -825,7 +836,19 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // never flooded.
         let mut bursting = false;
         let mut burst_budget = Duration::ZERO;
+        let stall_threshold = Duration::from_millis((chunk_ms.saturating_mul(4).max(20)) as u64);
+        let mut last_encode_iteration = Instant::now();
         loop {
+            let iteration_started = Instant::now();
+            let iteration_gap = iteration_started.duration_since(last_encode_iteration);
+            last_encode_iteration = iteration_started;
+            if iteration_gap > stall_threshold {
+                encode_stalls.fetch_add(1, Ordering::Relaxed);
+                max_encode_stall_ms.fetch_max(
+                    iteration_gap.as_millis().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
                 thread::sleep(Duration::from_millis(250));
@@ -844,6 +867,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 bursting = false;
                 burst_budget = Duration::ZERO;
                 drift_started_at = Instant::now();
+                last_encode_iteration = Instant::now();
                 continue;
             }
             let (should_burst, post_pop_depth) = {
@@ -921,6 +945,27 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Task Scheduler defaults unattended tasks to priority 7
+/// (`BelowNormal`). Normalize the sender to `Normal` in-process so a
+/// routine CPU spike is less likely to deschedule the 3 ms encode loop.
+/// This is intentionally best-effort: failure is observable but must not
+/// prevent audio from starting.
+#[cfg(target_os = "windows")]
+fn normalize_sender_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, NORMAL_PRIORITY_CLASS,
+    };
+
+    let result = unsafe { SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS) };
+    match result {
+        Ok(()) => info!("sender process priority normalized to Normal"),
+        Err(error) => warn!(%error, "failed to normalize sender process priority"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn normalize_sender_priority() {}
+
 /// Periodic stats reporter for the sender. Emits a tracing `info!`
 /// line when `console` is true, and a JSONL `send_stats` event when
 /// a log file is configured.
@@ -934,6 +979,8 @@ fn spawn_periodic_sender_stats(
     capture_ring: Arc<Mutex<Option<CaptureRing>>>,
     send_drift_ppm: Arc<AtomicU32>,
     send_drift_slope: Arc<AtomicU32>,
+    encode_stalls: Arc<AtomicU64>,
+    max_encode_stall_ms: Arc<AtomicU64>,
     console: bool,
     jsonl: Arc<JsonlLogger>,
     control: ControlState,
@@ -961,9 +1008,14 @@ fn spawn_periodic_sender_stats(
             let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
             let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
             let capture_underruns = ring_stats.map(|s| s.underruns).unwrap_or(0);
+            let capture_callbacks = ring_stats.map(|s| s.callbacks).unwrap_or(0);
+            let capture_pushed_samples = ring_stats.map(|s| s.pushed_samples).unwrap_or(0);
+            let capture_nonzero_samples = ring_stats.map(|s| s.nonzero_samples).unwrap_or(0);
             let capture_ring_samples = ring_stats.map(|s| s.samples).unwrap_or(0);
             let send_drift_ppm = f32::from_bits(send_drift_ppm.load(Ordering::Relaxed));
             let send_drift_slope = f32::from_bits(send_drift_slope.load(Ordering::Relaxed));
+            let encode_stalls = encode_stalls.load(Ordering::Relaxed);
+            let max_encode_stall_ms = max_encode_stall_ms.load(Ordering::Relaxed);
             let paused = control.is_paused();
             let gain = control.gain();
             let gain_source = match control.gain_source() {
@@ -982,9 +1034,14 @@ fn spawn_periodic_sender_stats(
                     capture_ring_high_water_ms,
                     capture_overruns,
                     capture_underruns,
+                    capture_callbacks,
+                    capture_pushed_samples,
+                    capture_nonzero_samples,
                     capture_ring_samples,
                     send_drift_ppm = format!("{send_drift_ppm:.1}"),
                     send_drift_slope = format!("{send_drift_slope:.1}"),
+                    encode_stalls,
+                    max_encode_stall_ms,
                     paused,
                     gain = format!("{:.2}", gain),
                     gain_source,
@@ -1007,9 +1064,20 @@ fn spawn_periodic_sender_stats(
                     ),
                     ("capture_overruns", JsonVal::from(capture_overruns)),
                     ("capture_underruns", JsonVal::from(capture_underruns)),
+                    ("capture_callbacks", JsonVal::from(capture_callbacks)),
+                    (
+                        "capture_pushed_samples",
+                        JsonVal::from(capture_pushed_samples),
+                    ),
+                    (
+                        "capture_nonzero_samples",
+                        JsonVal::from(capture_nonzero_samples),
+                    ),
                     ("capture_ring_samples", JsonVal::from(capture_ring_samples)),
                     ("send_drift_ppm", JsonVal::from(send_drift_ppm as f64)),
                     ("send_drift_slope", JsonVal::from(send_drift_slope as f64)),
+                    ("encode_stalls", JsonVal::from(encode_stalls)),
+                    ("max_encode_stall_ms", JsonVal::from(max_encode_stall_ms)),
                     ("paused", JsonVal::from(paused)),
                     ("gain", JsonVal::from(gain as f64)),
                     ("gain_source", JsonVal::from(gain_source)),
@@ -1445,13 +1513,14 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         // --prebuffer-ms ≈ --rx-buffer-ms (e.g. 200/300),
                         // high_water can collapse to target+1, causing
                         // continuous packet drops / crackle. Enforce a
-                        // minimum gap of 50 ms so there is headroom
-                        // between the trim threshold and the playback
-                        // target.
+                        // minimum gap of 50 ms and normally allow 4×
+                        // the prebuffer target. The wider threshold
+                        // absorbs bounded sender catch-up bursts without
+                        // turning them into audible packet-skip trims.
                         let min_gap_frames =
                             (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
                         let high_water_frames = prebuffer_target_frames
-                            .saturating_mul(2)
+                            .saturating_mul(4)
                             .max(plus_100)
                             .min(
                                 (rx_buffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
@@ -1596,7 +1665,7 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             let min_gap_frames_fmt =
                                 (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
                             let high_water_frames = prebuffer_target_frames
-                                .saturating_mul(2)
+                                .saturating_mul(4)
                                 .max(plus_100)
                                 .min(
                                     (rx_buffer_ms
@@ -1727,7 +1796,8 @@ fn spawn_periodic_receiver_stats(
                 queued_frames,
                 queued_ms,
                 fp,
-                fp_active,
+                format_conversion_active,
+                drift_correction_active,
                 input_rate_hz,
                 input_channels,
                 recv_rate,
@@ -1748,9 +1818,11 @@ fn spawn_periodic_receiver_stats(
                             0
                         };
                         let fp = state.pipeline.stats();
-                        let fp_active = !state.pipeline.is_passthrough();
                         let recv_rate = state.pipeline.resampler().output_rate_hz();
                         let recv_ch = state.pipeline.mixer().output_channels();
+                        let format_conversion_active =
+                            state.input_rate_hz != recv_rate || state.input_channels != recv_ch;
+                        let drift_correction_active = state.pipeline.resampler().drift_active();
                         let drift_ppm = state.drift_tracker.current_ppm();
                         let drift_slope = state.drift_tracker.current_slope();
                         (
@@ -1758,7 +1830,8 @@ fn spawn_periodic_receiver_stats(
                             queued_frames,
                             queued_ms,
                             fp,
-                            fp_active,
+                            format_conversion_active,
+                            drift_correction_active,
                             state.input_rate_hz,
                             state.input_channels,
                             recv_rate,
@@ -1775,7 +1848,7 @@ fn spawn_periodic_receiver_stats(
                 *guard
             }; // decode_stats guard dropped here
             if console {
-                if fp_active {
+                if format_conversion_active {
                     info!(
                         decode_errors = d.total(),
                         decode_truncated = d.truncated,
@@ -1795,6 +1868,7 @@ fn spawn_periodic_receiver_stats(
                         queued_ms,
                         drift_ppm = format!("{drift_ppm:.1}"),
                         drift_slope = format!("{drift_slope:.1}"),
+                        drift_correction_active,
                         sender_sample_rate = input_rate_hz,
                         sender_channels = input_channels,
                         receiver_sample_rate = recv_rate,
@@ -1823,6 +1897,7 @@ fn spawn_periodic_receiver_stats(
                         queued_ms,
                         drift_ppm = format!("{drift_ppm:.1}"),
                         drift_slope = format!("{drift_slope:.1}"),
+                        drift_correction_active,
                         sample_rate = input_rate_hz,
                         channels = input_channels,
                         "teehee recv stats"
@@ -1851,7 +1926,14 @@ fn spawn_periodic_receiver_stats(
                     ("drift_slope", JsonVal::from(drift_slope as f64)),
                     ("sample_rate", JsonVal::from(input_rate_hz)),
                     ("channels", JsonVal::from(input_channels)),
-                    ("format_conversion_active", JsonVal::from(fp_active)),
+                    (
+                        "format_conversion_active",
+                        JsonVal::from(format_conversion_active),
+                    ),
+                    (
+                        "drift_correction_active",
+                        JsonVal::from(drift_correction_active),
+                    ),
                 ],
             );
         }

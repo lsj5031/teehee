@@ -37,6 +37,14 @@ pub struct CaptureRingStats {
     /// Number of encode-loop reads that could not supply one complete
     /// packet and therefore caused the sender to transmit silence.
     pub underruns: u64,
+    /// Number of non-empty capture callbacks received from the audio API.
+    pub callbacks: u64,
+    /// Total samples delivered by capture callbacks.
+    pub pushed_samples: u64,
+    /// Captured samples whose absolute amplitude exceeded the silence
+    /// floor. Distinguishes an active-but-silent endpoint from actual
+    /// source audio without logging PCM.
+    pub nonzero_samples: u64,
     /// Capacity in samples.
     pub capacity_samples: usize,
 }
@@ -51,6 +59,9 @@ pub struct CaptureRing {
     high_water_samples: usize,
     overruns: u64,
     underruns: u64,
+    callbacks: u64,
+    pushed_samples: u64,
+    nonzero_samples: u64,
     high_water_samples_seen: usize,
 }
 
@@ -91,6 +102,9 @@ impl CaptureRing {
             high_water_samples,
             overruns: 0,
             underruns: 0,
+            callbacks: 0,
+            pushed_samples: 0,
+            nonzero_samples: 0,
             high_water_samples_seen: 0,
         }
     }
@@ -100,6 +114,11 @@ impl CaptureRing {
         if data.is_empty() {
             return;
         }
+        self.callbacks = self.callbacks.saturating_add(1);
+        self.pushed_samples = self.pushed_samples.saturating_add(data.len() as u64);
+        self.nonzero_samples = self
+            .nonzero_samples
+            .saturating_add(data.iter().filter(|sample| sample.abs() > 1.0e-6).count() as u64);
         // Fast path: fits entirely.
         if self.samples.len() + data.len() <= self.capacity_samples {
             self.samples.extend_from_slice(data);
@@ -198,6 +217,9 @@ impl CaptureRing {
             high_water_ms: self.samples_to_ms(self.high_water_samples_seen),
             overruns: self.overruns,
             underruns: self.underruns,
+            callbacks: self.callbacks,
+            pushed_samples: self.pushed_samples,
+            nonzero_samples: self.nonzero_samples,
             capacity_samples: self.capacity_samples,
         }
     }
@@ -217,6 +239,10 @@ mod unit {
         let mut r = ring_48k_stereo_20ms_chunk(200);
         let chunk: Vec<f32> = (0..1920).map(|i| i as f32).collect();
         r.push(&chunk);
+        let stats = r.stats();
+        assert_eq!(stats.callbacks, 1);
+        assert_eq!(stats.pushed_samples, 1920);
+        assert_eq!(stats.nonzero_samples, 1919);
         assert_eq!(r.len(), 1920);
         let out = r.pop_chunk(1920).unwrap();
         assert_eq!(out, chunk);

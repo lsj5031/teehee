@@ -480,6 +480,7 @@ task below is all of them, configured.
 | Execution time limit | Disabled (`PT0S`) | A long-running task must not be killed after 72 h. |
 | Start on battery | Allowed | A laptop at logon on battery must still start. |
 | Restart on failure | Every 1 min, up to 3× | Bonus; see the caveat below. |
+| Priority | Normal (`4`) | Audio pacing must not run at Task Scheduler's default below-normal priority. The sender also normalizes itself to `Normal` at startup when changing the task requires elevation. |
 
 ### Single-instance guard
 
@@ -524,6 +525,7 @@ schtasks /create /tn TeeHeeSender /xml "C:\path\to\teehee_task.xml" /f
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <Priority>4</Priority>
     <RestartOnFailure>
       <Count>3</Count>
       <Interval>PT1M</Interval>
