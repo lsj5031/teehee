@@ -129,6 +129,12 @@ pub struct Stats {
     /// stall occurred; playback resumes automatically once enough
     /// packets arrive.
     pub underrun_resyncs: u64,
+    /// Number of times an incoming packet was at least one complete
+    /// ring ahead of the playback head. At that point the buffered
+    /// timeline has already been overwritten and cannot recover by
+    /// rejecting individual collisions, so the receiver clears the
+    /// stale ring and re-enters prebuffer mode on the new sequence.
+    pub overrun_resyncs: u64,
 }
 
 struct Slot {
@@ -273,6 +279,7 @@ impl JitterBuffer {
             "samples.len() must match samples_per_packet"
         );
         let idx = (seq as usize) % self.capacity_packets;
+        let mut overrun_resync = false;
 
         // Prebuffer resync-floor guard: while in prebuffer
         // (head.is_none()), reject seq strictly earlier than the
@@ -329,7 +336,24 @@ impl JitterBuffer {
                     return PushOutcome::Late;
                 }
             }
+        }
 
+        // Incoming data at least one complete ring ahead of playback
+        // means the receiver has irrecoverably fallen behind. The old
+        // behaviour kept overwriting future slots and rejecting the
+        // active slot as MidReadCollision, which could sustain broken
+        // audio or silence indefinitely. Drop the stale timeline and
+        // rebuffer from this packet instead.
+        if let Some(head) = self.head {
+            let ahead = seq.wrapping_sub(head);
+            if !modular_is_earlier_or_equal(seq, head) && ahead >= self.capacity_packets as u32 {
+                self.reset_state();
+                self.stats.overrun_resyncs += 1;
+                overrun_resync = true;
+            }
+        }
+
+        if let Some(head) = self.head {
             // Mid-read slot collision: if the slot the new seq would
             // land in is the slot the audio callback is currently
             // draining (same modular index, partial consumption),
@@ -410,7 +434,11 @@ impl JitterBuffer {
             self.min_pushed = Some(seq);
         }
 
-        PushOutcome::Stored
+        if overrun_resync {
+            PushOutcome::StreamReset
+        } else {
+            PushOutcome::Stored
+        }
     }
 
     /// Fill `out` with up to `out.len()` interleaved `f32` samples,
@@ -841,15 +869,15 @@ mod unit {
         );
     }
 
-    // ----- mid-read slot collision reject path -----
+    // ----- full-ring overrun recovery path -----
 
     #[test]
-    fn mid_read_slot_collision_short_circuits_to_mid_read_outcome() {
+    fn full_ring_ahead_resets_instead_of_mid_read_collision_storm() {
         // Push seq=0. Begin reading — pop 2 of 4 so head_offset = 2.
         // The slot index for seq=0 is `0 % 4 = 0`. A push with seq =
         // capacity (= 4) lands at slot index 4 % 4 = 0 — same slot,
-        // and head_offset > 0, so the buffer must refuse and report
-        // MidReadCollision (NOT overwrite the active slot).
+        // and head_offset > 0. Because this is also one complete ring
+        // ahead, the stale timeline must be reset and rebuffered.
         let mut buf = JitterBuffer::new(4, 4, None);
         tag_packet(&mut buf, 0);
 
@@ -864,20 +892,16 @@ mod unit {
         let outcome = buf.push(4, &collision_packet);
         assert_eq!(
             outcome,
-            PushOutcome::MidReadCollision,
-            "mid-read slot collision must be refused"
+            PushOutcome::StreamReset,
+            "full-ring overrun must reset the stale timeline"
         );
-        assert_eq!(
-            buf.stats().mid_read_collisions,
-            1,
-            "mid_read_collisions counter must increment"
-        );
+        assert_eq!(buf.stats().mid_read_collisions, 0);
+        assert_eq!(buf.stats().overrun_resyncs, 1);
 
-        // Continue draining seq=0; the data must NOT have been
-        // corrupted by the refused push.
-        let mut b = [0.0_f32; 2];
+        // The new sequence is retained as the fresh anchor.
+        let mut b = [0.0_f32; 4];
         buf.pop_frames(&mut b);
-        assert_eq!(b, [0.001, 0.001], "active slot data must survive");
+        assert_eq!(b, [42.0; 4]);
     }
 
     #[test]
@@ -1126,7 +1150,7 @@ mod unit {
     }
 
     #[test]
-    fn ring_overruns_increments_when_overwriting_unplayed_future_slot() {
+    fn full_ring_overrun_resyncs_before_overwriting_future_slot() {
         // 4-slot ring, fill seq=0..=3 (4 Stored). Play seq=0 only
         // (advance head), then push seq=4. Slot idx 4 % 4 = 0,
         // currently filled with seq=0 — strictly equal to head
@@ -1162,38 +1186,26 @@ mod unit {
         let mut s5 = [5.0_f32; 4];
         s5[0] += 0.001;
         let outcome = buf.push(5, &s5);
-        assert_eq!(
-            outcome,
-            PushOutcome::Stored,
-            "overwriting future slot is Stored"
-        );
-        assert_eq!(
-            buf.stats().ring_overruns,
-            1,
-            "overwriting unplayed future slot must increment ring_overruns"
-        );
+        assert_eq!(outcome, PushOutcome::StreamReset);
+        assert_eq!(buf.stats().ring_overruns, 0);
+        assert_eq!(buf.stats().overrun_resyncs, 1);
     }
 
     #[test]
-    fn ring_overruns_does_not_fire_on_mid_read_collision() {
-        // MidReadCollision is a narrower reject path (slot == head_idx
-        // AND head_offset > 0) and the packet is REFUSED. ring_overruns
-        // must remain 0 in this branch because no overwrite happens.
-        // (See the existing mid_read_slot_collision_short_circuits
-        // test — we replicate the scenario just to pin the disjoint
-        // accounting.)
+    fn ring_overruns_does_not_fire_on_overrun_resync() {
         let mut buf = JitterBuffer::new(4, 4, None);
         tag_packet(&mut buf, 0);
         let mut a = [0.0_f32; 2];
         buf.pop_frames(&mut a);
         let collision_packet = vec![42.0_f32; 4];
         let outcome = buf.push(4, &collision_packet);
-        assert_eq!(outcome, PushOutcome::MidReadCollision);
+        assert_eq!(outcome, PushOutcome::StreamReset);
         assert_eq!(
             buf.stats().ring_overruns,
             0,
-            "refused push must not count as overrun"
+            "resync clears instead of overwriting"
         );
+        assert_eq!(buf.stats().overrun_resyncs, 1);
     }
 
     #[test]
@@ -1351,12 +1363,7 @@ mod unit {
     }
 
     #[test]
-    fn ring_overruns_independent_of_mid_read_collisions() {
-        // A push that lands in the active mid-read slot AND would
-        // also be a true overrun (i.e., not strictly MidReadCollision
-        // because head_offset == 0 by then) still bumps ring_overruns.
-        // Conversely a MidReadCollision that gets refused bumps
-        // neither. The two counters track disjoint events.
+    fn first_full_ring_overrun_reanchors_and_subsequent_packets_store() {
         let mut buf = small_buffer();
         for s in 0..4u32 {
             tag_packet(&mut buf, s);
@@ -1377,23 +1384,13 @@ mod unit {
         // NOT fire; ring_overruns does).
         let mut s5 = [5.0_f32; 4];
         s5[0] += 0.001;
-        buf.push(5, &s5);
-        assert_eq!(
-            buf.stats().ring_overruns,
-            1,
-            "slot.seq == head race window counts as overrun"
-        );
-        // Push seq=6 into slot[2] (currently holds seq=2, strictly
-        // future within ring capacity — another ring_overruns++).
+        assert_eq!(buf.push(5, &s5), PushOutcome::StreamReset);
+        assert_eq!(buf.stats().overrun_resyncs, 1);
+        assert_eq!(buf.stats().ring_overruns, 0);
+        // The reset timeline accepts following packets normally.
         let mut s6 = [6.0_f32; 4];
         s6[0] += 0.001;
-        buf.push(6, &s6);
-        assert_eq!(
-            buf.stats().ring_overruns,
-            2,
-            "strict future within capacity also counts"
-        );
-        // No mid_read_collisions happened in this scenario.
+        assert_eq!(buf.push(6, &s6), PushOutcome::Stored);
         assert_eq!(buf.stats().mid_read_collisions, 0);
     }
 }

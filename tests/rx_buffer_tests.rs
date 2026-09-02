@@ -222,7 +222,7 @@ fn ring_overruns_default_is_zero() {
 }
 
 #[test]
-fn ring_overruns_increments_on_overwrite_of_unplayed_future_slot() {
+fn full_ring_overrun_reanchors_instead_of_overwriting_future_slot() {
     let mut buf = small_ring();
     // Fill 4 packets (slots 0..3 with seq 0..3).
     for s in 0..4u32 {
@@ -240,24 +240,15 @@ fn ring_overruns_increments_on_overwrite_of_unplayed_future_slot() {
 
     // Push seq=5 into slot[1] (currently holds seq=1, unplayed
     // future) — true ring overrun.
-    push_tag(&mut buf, 5);
-    assert_eq!(
-        buf.stats().ring_overruns,
-        1,
-        "overwriting unplayed future slot must increment ring_overruns"
-    );
+    let mut samples = vec![5.0_f32; 4];
+    samples[0] += 0.001;
+    assert_eq!(buf.push(5, &samples), PushOutcome::StreamReset);
+    assert_eq!(buf.stats().ring_overruns, 0);
+    assert_eq!(buf.stats().overrun_resyncs, 1);
 }
 
 #[test]
-fn ring_overruns_independent_of_mid_read_collisions() {
-    // A sequence of overload pushes (no MidReadCollision path active)
-    // increments ring_overruns exactly N times for N overwrites,
-    // and never inadvertently bumps mid_read_collisions.
-    //
-    // Slice 10 (Tier 3 #9) introduced `ring_overruns` with an
-    // at-or-forward-within-capacity window (not strict-future-only),
-    // so the slot.seq == head case also counts. This test pins
-    // both shapes under the new semantic.
+fn overrun_resync_prevents_collision_storm_and_accepts_following_packets() {
     let mut buf = small_ring();
     for s in 0..4u32 {
         push_tag(&mut buf, s);
@@ -281,22 +272,13 @@ fn ring_overruns_independent_of_mid_read_collisions() {
     );
     // Push seq=6 → idx=2, slot[2].seq=2 == head=2 → the
     // "slot-at-head" race window path (`fwd == 0`). ring_overruns++.
-    push_tag(&mut buf, 6);
-    assert_eq!(
-        buf.stats().ring_overruns,
-        1,
-        "slot.seq == head race window counts as overrun"
-    );
-    // Push seq=7 → idx=3, slot[3].seq=3, head=2, fwd=1 < cap=4 →
-    // strict future within capacity. ring_overruns++.
+    let mut s6 = vec![6.0_f32; 4];
+    s6[0] += 0.001;
+    assert_eq!(buf.push(6, &s6), PushOutcome::StreamReset);
+    assert_eq!(buf.stats().overrun_resyncs, 1);
+    assert_eq!(buf.stats().ring_overruns, 0);
+    // Following packets belong to the new timeline and store cleanly.
     push_tag(&mut buf, 7);
-    assert_eq!(
-        buf.stats().ring_overruns,
-        2,
-        "strict future within capacity also counts as overrun"
-    );
-    // mid_read_collisions remained zero throughout (no cpal mid-read
-    // scenario was constructed in this test — only the Stored path).
     assert_eq!(buf.stats().mid_read_collisions, 0);
 }
 
@@ -333,6 +315,7 @@ fn legacy_stats_fields_remain_after_slice10() {
     let _: u64 = s.mid_read_collisions;
     let _: u64 = s.prebuffer_holds;
     let _: u64 = s.ring_overruns;
+    let _: u64 = s.overrun_resyncs;
 }
 
 // ----- Sender-vs-receiver math sanity -----

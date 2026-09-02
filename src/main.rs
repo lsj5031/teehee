@@ -960,6 +960,7 @@ fn spawn_periodic_sender_stats(
             let capture_ring_ms = ring_stats.map(|s| s.depth_ms).unwrap_or(0);
             let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
             let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
+            let capture_underruns = ring_stats.map(|s| s.underruns).unwrap_or(0);
             let capture_ring_samples = ring_stats.map(|s| s.samples).unwrap_or(0);
             let send_drift_ppm = f32::from_bits(send_drift_ppm.load(Ordering::Relaxed));
             let send_drift_slope = f32::from_bits(send_drift_slope.load(Ordering::Relaxed));
@@ -980,6 +981,7 @@ fn spawn_periodic_sender_stats(
                     capture_ring_ms,
                     capture_ring_high_water_ms,
                     capture_overruns,
+                    capture_underruns,
                     capture_ring_samples,
                     send_drift_ppm = format!("{send_drift_ppm:.1}"),
                     send_drift_slope = format!("{send_drift_slope:.1}"),
@@ -1004,6 +1006,7 @@ fn spawn_periodic_sender_stats(
                         JsonVal::from(capture_ring_high_water_ms),
                     ),
                     ("capture_overruns", JsonVal::from(capture_overruns)),
+                    ("capture_underruns", JsonVal::from(capture_underruns)),
                     ("capture_ring_samples", JsonVal::from(capture_ring_samples)),
                     ("send_drift_ppm", JsonVal::from(send_drift_ppm as f64)),
                     ("send_drift_slope", JsonVal::from(send_drift_slope as f64)),
@@ -1787,6 +1790,7 @@ fn spawn_periodic_receiver_stats(
                         sender_restarts = jb_stats.sender_restarts,
                         latency_trims = jb_stats.latency_trims,
                         underrun_resyncs = jb_stats.underrun_resyncs,
+                        overrun_resyncs = jb_stats.overrun_resyncs,
                         queued_frames,
                         queued_ms,
                         drift_ppm = format!("{drift_ppm:.1}"),
@@ -1814,6 +1818,7 @@ fn spawn_periodic_receiver_stats(
                         sender_restarts = jb_stats.sender_restarts,
                         latency_trims = jb_stats.latency_trims,
                         underrun_resyncs = jb_stats.underrun_resyncs,
+                        overrun_resyncs = jb_stats.overrun_resyncs,
                         queued_frames,
                         queued_ms,
                         drift_ppm = format!("{drift_ppm:.1}"),
@@ -1839,6 +1844,7 @@ fn spawn_periodic_receiver_stats(
                     ("sender_restarts", JsonVal::from(jb_stats.sender_restarts)),
                     ("latency_trims", JsonVal::from(jb_stats.latency_trims)),
                     ("underrun_resyncs", JsonVal::from(jb_stats.underrun_resyncs)),
+                    ("overrun_resyncs", JsonVal::from(jb_stats.overrun_resyncs)),
                     ("queued_frames", JsonVal::from(queued_frames)),
                     ("queued_ms", JsonVal::from(queued_ms)),
                     ("drift_ppm", JsonVal::from(drift_ppm as f64)),

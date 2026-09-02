@@ -34,6 +34,9 @@ pub struct CaptureRingStats {
     pub high_water_ms: u64,
     /// Cumulative samples dropped because the ring was full.
     pub overruns: u64,
+    /// Number of encode-loop reads that could not supply one complete
+    /// packet and therefore caused the sender to transmit silence.
+    pub underruns: u64,
     /// Capacity in samples.
     pub capacity_samples: usize,
 }
@@ -47,6 +50,7 @@ pub struct CaptureRing {
     /// Fill level (samples) that triggers catch-up mode on the encode loop.
     high_water_samples: usize,
     overruns: u64,
+    underruns: u64,
     high_water_samples_seen: usize,
 }
 
@@ -86,6 +90,7 @@ impl CaptureRing {
             channels,
             high_water_samples,
             overruns: 0,
+            underruns: 0,
             high_water_samples_seen: 0,
         }
     }
@@ -145,6 +150,7 @@ impl CaptureRing {
     /// Pop exactly `chunk_samples` if available.
     pub fn pop_chunk(&mut self, chunk_samples: usize) -> Option<Vec<f32>> {
         if self.samples.len() < chunk_samples {
+            self.underruns = self.underruns.saturating_add(1);
             return None;
         }
         Some(self.samples.drain(..chunk_samples).collect())
@@ -191,6 +197,7 @@ impl CaptureRing {
             depth_ms: self.samples_to_ms(self.samples.len()),
             high_water_ms: self.samples_to_ms(self.high_water_samples_seen),
             overruns: self.overruns,
+            underruns: self.underruns,
             capacity_samples: self.capacity_samples,
         }
     }
