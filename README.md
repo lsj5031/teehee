@@ -618,6 +618,20 @@ point, with two modes:
 
 Alerts append a timestamped line to `logs/send_alerts.log`, play an
 audible alert, and (in `-Check` mode) best-effort pop a message box.
+The watcher also alerts once when `capture_nonzero_samples` has not
+changed for 4 hours. WASAPI loopback stops producing data when the PC
+is idle, so this is informational unless audio should be playing; the
+alert recovers when non-silent samples resume or the sender restarts. Set
+`-CaptureQuietHours 0` to disable it or pass another hour threshold.
+Repeated drift-saturation transitions are rate-limited to one alert
+per 6 hours by default (`-DriftAlertCooldownMinutes 360`), while a
+sustained saturation remains a single active condition. Drift
+saturation is only alerted while non-silent audio has been captured
+within the last 2 minutes (`-DriftQuietSuppressSecs 120`): the
+compensator saturating while the capture engine is silent or idle is
+expected (ring drained, nothing streaming) and is suppressed, so
+these benign audio start/stop transitions do not page the operator.
+
 The "sender down" check uses a 240 s stale threshold: the sender task
 self-heals within ~2 min, so stats older than 4 min mean self-healing
 has failed and the operator should look (`schtasks /run /tn
