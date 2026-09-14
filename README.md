@@ -64,16 +64,16 @@ runtime, no Python, no PortAudio, no installer.
 events and periodic `recv_stats` / `send_stats` records — ideal for Task
 Scheduler deploys where console output is discarded. Example fields:
 `queued_ms` (live playout delay), `latency_trims`, `capture_ring_ms`,
-`capture_overruns`, `send_drift_ppm`. Use with or without `--stats`
-(console tracing).
+`capture_overruns`, `capture_latency_drops`, `send_drift_ppm`. Use with
+or without `--stats` (console tracing).
 
 `--prebuffer-ms` (slice 6) is the *gate*: the receiver waits in
 silence until at least this many ms of audio have accumulated in
 the jitter buffer, then playback starts. After start, fill above
-roughly `2× prebuffer` is trimmed (packets skipped) so lag cannot
-silently climb toward `--rx-buffer-ms`. Lower for lower first-byte
-latency (cost: more dropouts on shaky networks); raise for flaky
-Wi-Fi.
+`prebuffer + 100 ms` is trimmed (packets skipped) so lag cannot silently
+climb toward `--rx-buffer-ms`. The threshold is capped by the configured
+receive-buffer depth. Lower prebuffer for lower first-byte latency (cost:
+more dropouts on shaky networks); raise it for flaky Wi-Fi.
 
 `--rx-buffer-ms` (slice 10) is the *ring depth*: the total buffering
 capacity, expressed in ms of audio. The jitter buffer is sized to
@@ -138,18 +138,23 @@ wall-clock-only pacing:
   chunks (periodic micro-dropouts). Now the sender slows to match
   and pops never starve.
 
-After a scheduling stall longer than 200 ms, the pacer burst-sends up
-to 200 ms of backlog (real audio only, bounded so the receiver’s
-jitter buffer is never flooded) so the ring recovers quickly instead
-of ratcheting toward the cap; any residue is drained by the drift
-compensator. Watch `capture_ring_ms` / `capture_overruns` /
-`send_drift_ppm` on `--stats` or in the JSONL log. `send_drift_ppm`
-is the applied pacing correction: near 0 means the capture clock
-matches the wall clock; ±50–200 is typical device skew; ±150 (the
-clamp) means the tracker is saturating — usually right after a stall
-or long pause, and it recovers. A permanently high `capture_ring_ms`
-now means the machine is CPU-starved (the encode loop is being
-preempted), not clock drift.
+After an encode scheduling stall longer than 20 ms (or four chunks),
+the sender keeps only its newest target-depth audio and resets its pacing
+clock. This produces a short content skip instead of forwarding stale
+audio as lasting receiver delay. `capture_latency_drops` counts the
+intentionally discarded samples separately from capacity-driven
+`capture_overruns`. Non-stall capture bursts may still catch up, but at
+most 200 ms is burst-sent before normal pacing resumes until the backlog
+clears. The Windows encode loop also registers for MMCSS `Pro Audio`
+priority to reduce scheduling stalls.
+
+Watch `capture_ring_ms` / `capture_latency_drops` / `capture_overruns` /
+`send_drift_ppm` on `--stats` or in the JSONL log. `send_drift_ppm` is the
+applied pacing correction: near 0 means the capture clock matches the wall
+clock; ±50–200 is typical device skew; ±150 (the clamp) means the tracker
+is saturating — usually right after a capture burst or long pause, and it
+recovers. A permanently high `capture_ring_ms` now means the machine is
+CPU-starved (the encode loop is being preempted), not clock drift.
 
 `--sample-rate` and `--channels` control the format for `--sine` dry-run
 mode only. For real capture (no `--sine`), the cpal / WASAPI device's

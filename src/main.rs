@@ -122,6 +122,67 @@ impl Drop for HighResTimer {
     }
 }
 
+/// Registers the real-capture encode loop with Windows MMCSS so routine
+/// foreground work is less likely to deschedule its 3 ms packet cadence.
+/// Registration is best-effort; unsupported systems continue at normal
+/// process priority.
+struct MmcssGuard {
+    #[cfg(target_os = "windows")]
+    handle: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+impl MmcssGuard {
+    fn acquire() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::core::{HSTRING, PCWSTR};
+            use windows::Win32::System::Threading::{
+                AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
+                AvSetMmThreadPriority, AVRT_PRIORITY_HIGH,
+            };
+
+            let task_name = HSTRING::from("Pro Audio");
+            let mut task_index = 0;
+            match unsafe {
+                AvSetMmThreadCharacteristicsW(PCWSTR(task_name.as_ptr()), &mut task_index)
+            } {
+                Ok(handle) => {
+                    if let Err(error) = unsafe { AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH) }
+                    {
+                        let _ = unsafe { AvRevertMmThreadCharacteristics(handle) };
+                        warn!(%error, "failed to raise sender encode thread MMCSS priority");
+                        Self { handle: None }
+                    } else {
+                        info!("sender encode thread registered with MMCSS Pro Audio priority");
+                        Self {
+                            handle: Some(handle),
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "failed to register sender encode thread with MMCSS");
+                    Self { handle: None }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(handle) = self.handle.take() {
+            let _ = unsafe {
+                windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(handle)
+            };
+        }
+    }
+}
+
 /// Windows-only single-instance guard for the `send` subcommand.
 ///
 /// A named mutex is the native Windows equivalent of the old bash
@@ -172,6 +233,29 @@ struct SendPacer {
     next_tick: Instant,
     #[cfg(target_os = "windows")]
     timer: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+#[derive(Default)]
+struct CatchupLimiter {
+    budget: Duration,
+}
+
+impl CatchupLimiter {
+    fn allow_burst(&mut self, backlog_high: bool, period: Duration) -> bool {
+        if !backlog_high {
+            self.budget = Duration::ZERO;
+            return false;
+        }
+        if self.budget >= SEND_CATCHUP_BOUND {
+            return false;
+        }
+        self.budget = self.budget.saturating_add(period);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.budget = Duration::ZERO;
+    }
 }
 
 impl SendPacer {
@@ -795,6 +879,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // pacing period (period_for_ppm) so the ring converges to a
         // small target fill and stays there — the same algorithm
         // the receiver uses for its jitter buffer.
+        let _mmcss = MmcssGuard::acquire();
         let base_period = Duration::from_millis(chunk_ms as u64);
         let mut pacer = SendPacer::new(base_period);
         // Target fill: at least 2 chunks, minimum 15 ms. The WASAPI
@@ -827,27 +912,38 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // against). Re-armed on pause/resume (the ring clear is the
         // same fill cliff).
         let mut drift_started_at = Instant::now();
-        // Bounded catch-up: after a stall longer than the pacer's
-        // 200 ms debt window, burst-send up to SEND_CATCHUP_BOUND
-        // of backlog so the ring recovers quickly instead of
-        // ratcheting toward the drop-oldest cap. Real audio only
-        // (bursting stops once the ring is below its high-water
-        // mark), and bounded so the receiver's jitter buffer is
-        // never flooded.
+        // Bounded catch-up handles capture-side bursts that happen
+        // without an encode-loop stall. Stall recovery trims stale
+        // samples above; this limiter prevents other burst sources
+        // from flooding the receiver indefinitely.
         let mut bursting = false;
-        let mut burst_budget = Duration::ZERO;
+        let mut catchup = CatchupLimiter::default();
         let stall_threshold = Duration::from_millis((chunk_ms.saturating_mul(4).max(20)) as u64);
         let mut last_encode_iteration = Instant::now();
         loop {
             let iteration_started = Instant::now();
             let iteration_gap = iteration_started.duration_since(last_encode_iteration);
             last_encode_iteration = iteration_started;
-            if iteration_gap > stall_threshold {
+            let stalled = iteration_gap > stall_threshold;
+            if stalled {
                 encode_stalls.fetch_add(1, Ordering::Relaxed);
                 max_encode_stall_ms.fetch_max(
                     iteration_gap.as_millis().min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
                 );
+                // We cannot recover elapsed wall time without either
+                // forwarding stale audio or flooding the receiver. Keep
+                // only the newest target-depth audio and start a fresh
+                // pacing epoch. A short content skip is preferable to
+                // minutes of accumulated live-stream latency.
+                pacer.reset();
+                drift.reset();
+                ema_depth.reset();
+                bursting = false;
+                catchup.reset();
+                drift_started_at = iteration_started;
+                send_drift_ppm.store(0.0f32.to_bits(), Ordering::Relaxed);
+                send_drift_slope.store(0.0f32.to_bits(), Ordering::Relaxed);
             }
             // Runtime control: pause/resume/volume.
             if control.is_paused() {
@@ -865,7 +961,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 drift.reset();
                 ema_depth.reset();
                 bursting = false;
-                burst_budget = Duration::ZERO;
+                catchup.reset();
                 drift_started_at = Instant::now();
                 last_encode_iteration = Instant::now();
                 continue;
@@ -874,6 +970,9 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 let mut guard = ring_slot.lock().unwrap();
                 match guard.as_mut() {
                     Some(ring) => {
+                        if stalled {
+                            ring.trim_to_latest(target_samples);
+                        }
                         let chunk = ring.pop_chunk(chunk_samples);
                         let depth = ring.len();
                         chunk_buf = chunk.unwrap_or_else(|| vec![0.0f32; chunk_samples]);
@@ -889,17 +988,23 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             // are withheld while bursting — the fast drain would
             // poison the slope regression, so the tracker is reset
             // at burst start and re-learns once pacing resumes.
-            let burst_now = should_burst && burst_budget < SEND_CATCHUP_BOUND;
+            let burst_now = catchup.allow_burst(should_burst, base_period);
+            if bursting && !burst_now {
+                // wait_next() was intentionally skipped during the burst,
+                // so its absolute deadline is stale. Start a fresh pacing
+                // epoch instead of replaying that deadline debt as another
+                // implicit burst after the explicit budget is exhausted.
+                pacer.reset();
+            }
             if burst_now {
                 if !bursting {
                     drift.reset();
                     ema_depth.reset();
+                    drift_started_at = Instant::now();
                 }
                 bursting = true;
-                burst_budget += base_period;
             } else if drift_started_at.elapsed() >= Duration::from_secs(5) {
                 bursting = false;
-                burst_budget = Duration::ZERO;
                 drift.update(ema_depth.update(post_pop_depth as f64) as usize);
                 let ppm = drift.current_ppm();
                 send_drift_ppm.store(ppm.to_bits(), Ordering::Relaxed);
@@ -909,7 +1014,6 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 }
             } else {
                 bursting = false;
-                burst_budget = Duration::ZERO;
             }
             control.apply_gain(&mut chunk_buf);
             let frame_ts = (seq as u64) * chunk_frames as u64;
@@ -1008,6 +1112,7 @@ fn spawn_periodic_sender_stats(
             let capture_ring_high_water_ms = ring_stats.map(|s| s.high_water_ms).unwrap_or(0);
             let capture_overruns = ring_stats.map(|s| s.overruns).unwrap_or(0);
             let capture_underruns = ring_stats.map(|s| s.underruns).unwrap_or(0);
+            let capture_latency_drops = ring_stats.map(|s| s.latency_drops).unwrap_or(0);
             let capture_callbacks = ring_stats.map(|s| s.callbacks).unwrap_or(0);
             let capture_pushed_samples = ring_stats.map(|s| s.pushed_samples).unwrap_or(0);
             let capture_nonzero_samples = ring_stats.map(|s| s.nonzero_samples).unwrap_or(0);
@@ -1034,6 +1139,7 @@ fn spawn_periodic_sender_stats(
                     capture_ring_high_water_ms,
                     capture_overruns,
                     capture_underruns,
+                    capture_latency_drops,
                     capture_callbacks,
                     capture_pushed_samples,
                     capture_nonzero_samples,
@@ -1064,6 +1170,10 @@ fn spawn_periodic_sender_stats(
                     ),
                     ("capture_overruns", JsonVal::from(capture_overruns)),
                     ("capture_underruns", JsonVal::from(capture_underruns)),
+                    (
+                        "capture_latency_drops",
+                        JsonVal::from(capture_latency_drops),
+                    ),
                     ("capture_callbacks", JsonVal::from(capture_callbacks)),
                     (
                         "capture_pushed_samples",
@@ -1148,18 +1258,32 @@ struct RxState {
     last_raw_queued: Option<usize>,
 }
 
-/// Sender pacing catch-up bound. When the encode loop falls behind
-/// its `chunk_ms` schedule (OS scheduling hiccup, transient send
-/// error, pause/resume), it burst-sends (skips the inter-packet
-/// sleep) to drain the backlog — instead of discarding the timing
-/// deficit and resuming a steady 1-packet-per-period pace that can
-/// never catch up. The deficit is bounded so a long stall (e.g. a
-/// 10 s pause) does not trigger a multi-second burst of stale or
-/// silence packets: anything older than the capture ring's depth is
-/// already drop-oldest'd, so catching up further would only flood
-/// the receiver with silence. 200 ms matches the default
-/// `--capture-buffer-ms` and is at most ~67 chunks at `chunk_ms=3`.
+/// Sender pacing catch-up bound for capture bursts that were not caused
+/// by an encode-loop stall. Stall recovery drops stale samples and resets
+/// the pacer; other burst sources may skip at most this much pacing debt
+/// before returning to normal cadence until the backlog clears.
 const SEND_CATCHUP_BOUND: Duration = Duration::from_millis(200);
+
+/// Extra receiver queue depth tolerated above the prebuffer target before
+/// old packets are discarded. This absorbs ordinary LAN jitter but trims
+/// sender catch-up bursts before they become long-lived playout delay.
+const RX_LATENCY_HEADROOM_MS: usize = 100;
+
+fn receiver_high_water_frames(
+    prebuffer_ms: usize,
+    rx_buffer_ms: usize,
+    sample_rate: u32,
+    channels: u8,
+) -> usize {
+    let samples_per_ms = sample_rate as usize * channels as usize;
+    let target = prebuffer_ms * samples_per_ms / 1000;
+    let desired = prebuffer_ms
+        .saturating_add(RX_LATENCY_HEADROOM_MS)
+        .saturating_mul(samples_per_ms)
+        / 1000;
+    let capacity = rx_buffer_ms.saturating_mul(samples_per_ms) / 1000;
+    desired.min(capacity).max(target)
+}
 
 /// Drift-tracker settle delay: withhold drift sampling for this long
 /// after `RxState` creation (first packet / format-change rebuild).
@@ -1503,30 +1627,14 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                         let prebuffer_target_frames =
                             (prebuffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
                                 / 1000;
-                        // High-water for latency trim: 2× prebuffer or
-                        // prebuffer + 100 ms, capped by rx-buffer depth.
-                        let plus_100 = ((prebuffer_ms + 100)
-                            * pkt.sample_rate as usize
-                            * pkt.channels as usize)
-                            / 1000;
-                        // FIX medium: hair-trigger trim guard. When
-                        // --prebuffer-ms ≈ --rx-buffer-ms (e.g. 200/300),
-                        // high_water can collapse to target+1, causing
-                        // continuous packet drops / crackle. Enforce a
-                        // minimum gap of 50 ms and normally allow 4×
-                        // the prebuffer target. The wider threshold
-                        // absorbs bounded sender catch-up bursts without
-                        // turning them into audible packet-skip trims.
-                        let min_gap_frames =
-                            (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
-                        let high_water_frames = prebuffer_target_frames
-                            .saturating_mul(4)
-                            .max(plus_100)
-                            .min(
-                                (rx_buffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
-                                    / 1000,
-                            )
-                            .max(prebuffer_target_frames.saturating_add(min_gap_frames));
+                        // Trim when queued audio exceeds prebuffer by 100 ms,
+                        // capped by the configured receive-buffer depth.
+                        let high_water_frames = receiver_high_water_frames(
+                            prebuffer_ms,
+                            rx_buffer_ms,
+                            pkt.sample_rate,
+                            pkt.channels,
+                        );
                         // Slice 10 (Tier 3 #9): explicitly derive
                         // `capacity_packets` from `--rx-buffer-ms`
                         // rather than the slice-6 hardcoded
@@ -1658,22 +1766,12 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             let prebuffer_target_frames =
                                 (prebuffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
                                     / 1000;
-                            let plus_100 = ((prebuffer_ms + 100)
-                                * pkt.sample_rate as usize
-                                * pkt.channels as usize)
-                                / 1000;
-                            let min_gap_frames_fmt =
-                                (50 * pkt.sample_rate as usize * pkt.channels as usize) / 1000;
-                            let high_water_frames = prebuffer_target_frames
-                                .saturating_mul(4)
-                                .max(plus_100)
-                                .min(
-                                    (rx_buffer_ms
-                                        * pkt.sample_rate as usize
-                                        * pkt.channels as usize)
-                                        / 1000,
-                                )
-                                .max(prebuffer_target_frames.saturating_add(min_gap_frames_fmt));
+                            let high_water_frames = receiver_high_water_frames(
+                                prebuffer_ms,
+                                rx_buffer_ms,
+                                pkt.sample_rate,
+                                pkt.channels,
+                            );
                             let capacity_packets = compute_capacity_packets(
                                 rx_buffer_ms,
                                 prebuffer_ms,
@@ -1976,4 +2074,35 @@ fn run_devices() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn catchup_limiter_stays_exhausted_until_backlog_clears() {
+        let mut limiter = CatchupLimiter::default();
+        let period = Duration::from_millis(50);
+
+        for _ in 0..4 {
+            assert!(limiter.allow_burst(true, period));
+        }
+        assert!(!limiter.allow_burst(true, period));
+        assert!(!limiter.allow_burst(true, period));
+
+        assert!(!limiter.allow_burst(false, period));
+        assert!(limiter.allow_burst(true, period));
+    }
+
+    #[test]
+    fn receiver_high_water_is_100_ms_above_default_prebuffer() {
+        assert_eq!(receiver_high_water_frames(200, 2_000, 48_000, 2), 28_800);
+    }
+
+    #[test]
+    fn receiver_high_water_never_exceeds_ring_capacity() {
+        assert_eq!(receiver_high_water_frames(200, 200, 48_000, 2), 19_200);
+        assert_eq!(receiver_high_water_frames(20, 100, 48_000, 2), 9_600);
+    }
 }

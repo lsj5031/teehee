@@ -37,6 +37,9 @@ pub struct CaptureRingStats {
     /// Number of encode-loop reads that could not supply one complete
     /// packet and therefore caused the sender to transmit silence.
     pub underruns: u64,
+    /// Samples intentionally discarded after an encode scheduling stall
+    /// so stale audio is not forwarded as added receiver latency.
+    pub latency_drops: u64,
     /// Number of non-empty capture callbacks received from the audio API.
     pub callbacks: u64,
     /// Total samples delivered by capture callbacks.
@@ -59,6 +62,7 @@ pub struct CaptureRing {
     high_water_samples: usize,
     overruns: u64,
     underruns: u64,
+    latency_drops: u64,
     callbacks: u64,
     pushed_samples: u64,
     nonzero_samples: u64,
@@ -102,6 +106,7 @@ impl CaptureRing {
             high_water_samples,
             overruns: 0,
             underruns: 0,
+            latency_drops: 0,
             callbacks: 0,
             pushed_samples: 0,
             nonzero_samples: 0,
@@ -175,6 +180,27 @@ impl CaptureRing {
         Some(self.samples.drain(..chunk_samples).collect())
     }
 
+    /// Keep only the newest `target_samples`, discarding stale audio from
+    /// the front of the ring. Returns the number of discarded samples.
+    /// Drops are aligned to complete audio frames so channel order remains
+    /// intact even when a caller supplies a non-aligned target.
+    pub fn trim_to_latest(&mut self, target_samples: usize) -> usize {
+        if self.samples.len() <= target_samples {
+            return 0;
+        }
+
+        let channels = self.channels as usize;
+        let requested_drop = self.samples.len() - target_samples;
+        let aligned_drop = requested_drop - (requested_drop % channels);
+        if aligned_drop == 0 {
+            return 0;
+        }
+
+        self.samples.drain(..aligned_drop);
+        self.latency_drops = self.latency_drops.saturating_add(aligned_drop as u64);
+        aligned_drop
+    }
+
     /// Drain all buffered samples. Used on pause/resume so stale
     /// audio captured during the pause is not replayed.
     pub fn clear(&mut self) {
@@ -217,6 +243,7 @@ impl CaptureRing {
             high_water_ms: self.samples_to_ms(self.high_water_samples_seen),
             overruns: self.overruns,
             underruns: self.underruns,
+            latency_drops: self.latency_drops,
             callbacks: self.callbacks,
             pushed_samples: self.pushed_samples,
             nonzero_samples: self.nonzero_samples,
@@ -285,6 +312,33 @@ mod unit {
         // Push more than high-water (2 chunks or 50ms).
         r.push(&vec![0.0; r.high_water_samples() + 1]);
         assert!(r.should_catch_up());
+    }
+
+    #[test]
+    fn trim_to_latest_discards_oldest_and_counts_latency_drop() {
+        let mut r = CaptureRing::new(40, 1_000, 2, 100);
+        let input: Vec<f32> = (0..400).map(|sample| sample as f32).collect();
+        r.push(&input);
+
+        let dropped = r.trim_to_latest(100);
+
+        assert_eq!(dropped, 300);
+        assert_eq!(r.len(), 100);
+        assert_eq!(r.pop_chunk(100).unwrap(), input[300..]);
+        assert_eq!(r.stats().latency_drops, 300);
+        assert_eq!(r.stats().overruns, 0);
+    }
+
+    #[test]
+    fn trim_to_latest_preserves_complete_stereo_frames() {
+        let mut r = CaptureRing::new(40, 1_000, 2, 100);
+        r.push(&(0..200).map(|sample| sample as f32).collect::<Vec<_>>());
+
+        let dropped = r.trim_to_latest(101);
+
+        assert_eq!(dropped, 98);
+        assert_eq!(r.len(), 102);
+        assert_eq!(r.stats().latency_drops, 98);
     }
 
     #[test]
