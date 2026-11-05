@@ -164,11 +164,15 @@ impl Advertiser {
             SERVICE_TYPE,
             instance,
             host,
-            "", // address auto-populated by daemon from host interfaces
+            "", // no explicit address; enable_addr_auto fills host interfaces
             port,
             Some(properties),
         )
-        .map_err(|e| AdvertiseError::ServiceInfo(e.to_string()))?;
+        .map_err(|e| AdvertiseError::ServiceInfo(e.to_string()))?
+        // An empty address set is not resolvable. mdns-sd only populates
+        // the service's A records from the host interfaces when this flag
+        // is set; without it senders see the service but never an address.
+        .enable_addr_auto();
         let fullname = service_info.get_fullname().to_string();
         daemon
             .register(service_info)

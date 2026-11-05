@@ -105,6 +105,8 @@ pub enum ProtocolError {
          payload must be non-empty and a whole number of interleaved f32 frames"
     )]
     InvalidPayloadLength { payload_len: usize, channels: u8 },
+    #[error("invalid sample rate in packet header: {sample_rate} Hz (must be >= 1)")]
+    InvalidSampleRate { sample_rate: u32 },
     /// Inbound `SampleFormat::I16` packets are surfaced as this error
     /// in teehee v1 receivers. v1 only emits and accepts interleaved
     /// `f32` PCM; an I16-tagged packet on the wire is most likely a
@@ -238,6 +240,12 @@ impl Packet {
             bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16],
         ]);
         let sample_rate = u32::from_le_bytes([bytes[17], bytes[18], bytes[19], bytes[20]]);
+        // A zero rate is structurally valid on the wire but cannot be
+        // used to build a resampler. Reject it here rather than panicking
+        // on the receive thread after the packet has been accepted.
+        if sample_rate == 0 {
+            return Err(ProtocolError::InvalidSampleRate { sample_rate });
+        }
         let channels = bytes[21];
         let sample_format = SampleFormat::from_tag(bytes[22])
             .ok_or(ProtocolError::UnsupportedSampleFormat(bytes[22]))?;
@@ -320,10 +328,11 @@ pub struct DecodeStats {
     pub bad_version: u64,
     /// `UnsupportedSampleFormat` (unknown tag),
     /// `UnsupportedInboundFormatI16` (tag 0x02 explicitly rejected),
-    /// `InvalidChannels`, and `InvalidPayloadLength`. Known-but-
-    /// unsupported and malformed audio format metadata are grouped
-    /// together because both share a fix path: fix/upgrade the sender
-    /// so it emits non-empty interleaved F32 frames.
+    /// `InvalidChannels`, `InvalidPayloadLength`, and
+    /// `InvalidSampleRate`. Known-but-unsupported and malformed audio
+    /// format metadata are grouped together because both share a fix
+    /// path: fix/upgrade the sender so it emits non-empty interleaved
+    /// F32 frames at a positive sample rate.
     pub bad_format: u64,
 }
 
@@ -352,6 +361,7 @@ impl DecodeStats {
             ProtocolError::UnsupportedSampleFormat(_)
             | ProtocolError::InvalidChannels { .. }
             | ProtocolError::InvalidPayloadLength { .. }
+            | ProtocolError::InvalidSampleRate { .. }
             | ProtocolError::UnsupportedInboundFormatI16 => self.bad_format += 1,
         }
     }
@@ -422,6 +432,10 @@ mod unit {
         });
         assert_eq!(s.bad_format, 4);
         assert_eq!(s.total(), 8);
+
+        s.record(&ProtocolError::InvalidSampleRate { sample_rate: 0 });
+        assert_eq!(s.bad_format, 5);
+        assert_eq!(s.total(), 9);
     }
 
     #[test]
@@ -446,6 +460,7 @@ mod unit {
                 payload_len: 2,
                 channels: 2,
             },
+            ProtocolError::InvalidSampleRate { sample_rate: 0 },
             ProtocolError::UnsupportedInboundFormatI16,
         ];
         // Cache length before the consuming loop: `record()` takes
@@ -455,6 +470,19 @@ mod unit {
             s.record(&v);
         }
         assert_eq!(s.total(), n_variants);
+    }
+
+    #[test]
+    fn decode_rejects_zero_sample_rate() {
+        // Build a structurally valid packet with an unusable rate. It
+        // must fail at the protocol boundary, before any resampler or
+        // playback state is constructed.
+        let pkt = Packet::new(7, 0, 0, 2, &[0.1, -0.1]);
+        let bytes = pkt.encode();
+        assert_eq!(
+            Packet::decode(&bytes),
+            Err(ProtocolError::InvalidSampleRate { sample_rate: 0 })
+        );
     }
 
     // ── FIX-2: payload limit validation ───────────────────────────

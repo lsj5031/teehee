@@ -70,3 +70,7 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+      - name: Log rotation regression tests
+        if: runner.os == 'Windows'
+        run: powershell -NoProfile -File tests/rotate_logs_tests.ps1

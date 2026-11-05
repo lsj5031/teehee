@@ -123,6 +123,14 @@ impl ControlState {
         self.gain_source.store(source as u8, Ordering::Relaxed);
     }
 
+    /// Set gain and snap the smoothed value to it immediately. Used for
+    /// the synchronous startup volume read so the first chunk starts at
+    /// the real system volume instead of ramping down from unity.
+    pub fn set_gain_with_source_immediate(&self, g: f32, source: GainSource) {
+        self.set_gain_with_source(g, source);
+        self.smoothed_gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+
     /// Apply the current gain multiplier to a sample buffer in place,
     /// with a smooth ramp from the previous gain to avoid audible
     /// clicks on volume changes. The ramp spans the entire buffer
@@ -368,7 +376,11 @@ fn read_system_volume() -> Option<f32> {
 pub fn read_and_apply_system_volume(state: &ControlState) -> Result<f32, &'static str> {
     read_system_volume()
         .inspect(|&vol| {
-            state.set_gain_with_source(vol, GainSource::System);
+            // Startup read: snap the smoother to the real volume so the
+            // first chunk is not faded in from 1.0 (especially important
+            // when the system starts muted). The background follower keeps
+            // using the normal smoothed setter for later changes.
+            state.set_gain_with_source_immediate(vol, GainSource::System);
         })
         .ok_or("failed to read system volume (no audio device or unsupported platform)")
 }
@@ -658,6 +670,16 @@ mod unit {
         assert!(buf[3].abs() < 1e-6, "buf[3] at target: {}", buf[3]);
         // After apply, smoothed_gain should be at the target.
         assert!((cs.smoothed_gain_for_test() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn startup_volume_snaps_smoothed_gain_instead_of_ramping_from_unity() {
+        let cs = ControlState::new();
+        cs.set_gain_with_source_immediate(0.0, GainSource::System);
+        assert_eq!(cs.smoothed_gain_for_test(), 0.0);
+        let mut buf = [1.0_f32; 8];
+        cs.apply_gain(&mut buf);
+        assert_eq!(buf, [0.0_f32; 8], "first chunk must start at system volume");
     }
 
     #[test]

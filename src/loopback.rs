@@ -434,33 +434,53 @@ mod wasapi_loopback_source {
             let bits_per_sample: u16 = unsafe {
                 std::ptr::read_unaligned(&raw const mixfmt.wave_fmt.Format.wBitsPerSample)
             };
-            // Slice 8 ships FLOAT-only; PCM-only render endpoints
-            // surface a clear actionable error. EXTENSIBLE is
-            // accepted as float-on-modern-Windows (SUBFORMAT
-            // GUID parsing is a follow-up slice).
+            // Slice 8 ships FLOAT-only. WAVE_FORMAT_EXTENSIBLE is a
+            // container: its SubFormat GUID (not just wFormatTag) decides
+            // whether the samples are float or integer PCM. Reading the
+            // GUID is required; treating every EXTENSIBLE format as f32
+            // would reinterpret integer samples as floats.
             const WAVE_FORMAT_PCM: u16 = 0x0001;
             const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
             const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-            let sample_format = match format_tag {
-                WAVE_FORMAT_IEEE_FLOAT => CapturedSampleFormat::F32,
-                WAVE_FORMAT_EXTENSIBLE => CapturedSampleFormat::F32,
-                WAVE_FORMAT_PCM => {
+            let subformat_tag: u16 = unsafe {
+                let subformat =
+                    std::ptr::read_unaligned(std::ptr::addr_of!(mixfmt.wave_fmt.SubFormat));
+                subformat.data1 as u16
+            };
+            let is_extensible_float =
+                format_tag == WAVE_FORMAT_EXTENSIBLE && subformat_tag == WAVE_FORMAT_IEEE_FLOAT;
+            let is_extensible_pcm =
+                format_tag == WAVE_FORMAT_EXTENSIBLE && subformat_tag == WAVE_FORMAT_PCM;
+            let sample_format = if format_tag == WAVE_FORMAT_IEEE_FLOAT || is_extensible_float {
+                if bits_per_sample != 32 {
                     return Err(anyhow::anyhow!(
-                        "render device mix format is PCM ({} bits/sample); \
-                         teehee v1 WASAPI loopback requires IEEE_FLOAT. \
-                         Switch to a render endpoint that exposes a \
-                         float mix format, or update teehee to add \
-                         PCM i16/i24 normalization in a follow-up slice",
+                        "render device mix format is IEEE_FLOAT with {} bits/sample; \
+                         teehee v1 WASAPI loopback requires 32-bit float",
                         bits_per_sample
                     ));
                 }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "render device uses unsupported mix format 0x{other:04x}; \
-                         teehee v1 supports 0x0003 (IEEE_FLOAT) and \
-                         0xFFFE (EXTENSIBLE)"
-                    ));
-                }
+                CapturedSampleFormat::F32
+            } else if format_tag == WAVE_FORMAT_PCM || is_extensible_pcm {
+                return Err(anyhow::anyhow!(
+                    "render device mix format is PCM ({} bits/sample); \
+                     teehee v1 WASAPI loopback requires IEEE_FLOAT. \
+                     Switch to a render endpoint that exposes a \
+                     float mix format, or update teehee to add \
+                     PCM i16/i24 normalization in a follow-up slice",
+                    bits_per_sample
+                ));
+            } else if format_tag == WAVE_FORMAT_EXTENSIBLE {
+                return Err(anyhow::anyhow!(
+                    "render device uses unsupported WAVE_FORMAT_EXTENSIBLE \
+                     subformat 0x{subformat_tag:04x}; teehee v1 WASAPI \
+                     loopback supports IEEE_FLOAT (0x0003) only"
+                ));
+            } else {
+                return Err(anyhow::anyhow!(
+                    "render device uses unsupported mix format 0x{format_tag:04x}; \
+                     teehee v1 supports 0x0003 (IEEE_FLOAT) and \
+                     0xFFFE (EXTENSIBLE) with an IEEE_FLOAT subformat"
+                ));
             };
             if channels == 0 {
                 return Err(anyhow::anyhow!(

@@ -60,7 +60,23 @@ function Rotate-Log([string]$path, [string]$archivePrefix, [long]$maxBytes) {
     # Copy-Item opens the source for read (sharing the sender's append
     # handle), then we truncate the live file in place. The sender's
     # open handle stays valid and keeps writing at the live path.
-    Copy-Item -Path $path -Destination $target -Force
+    # The copy MUST succeed before the live log is truncated; a failed
+    # archive would otherwise destroy the only copy of the data.
+    try {
+        Copy-Item -Path $path -Destination $target -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        Write-Host "[ROTATE] ERROR: could not archive $path - $($_.Exception.Message); live log left intact"
+        return
+    }
+    $archived = Get-Item -LiteralPath $target -ErrorAction SilentlyContinue
+    # The sender can append after the initial size check. A successful
+    # copy may therefore be larger than that snapshot; only a shorter
+    # archive indicates that the original contents were not preserved.
+    if (-not $archived -or $archived.Length -lt $size) {
+        Write-Host "[ROTATE] ERROR: archive verification failed for $target; live log left intact"
+        return
+    }
     # Truncate: open for write (not append) with ReadWrite share so it
     # does not conflict with the sender's open append handle, then close
     # immediately. The sender's handle is unaffected; its next write
@@ -69,10 +85,10 @@ function Rotate-Log([string]$path, [string]$archivePrefix, [long]$maxBytes) {
         $stream = [System.IO.File]::Open($path, 'Truncate', 'Write', 'ReadWrite')
         $stream.Close()
     } catch {
-        Write-Host "[ROTATE] WARNING: could not truncate $path - $($_.Exception.Message)"
+        Write-Host "[ROTATE] WARNING: could not truncate $path - $($_.Exception.Message); archive retained"
+        return
     }
-    $displayName = if ((Get-Item $target -ErrorAction SilentlyContinue)) { (Get-Item $target).Name } else { $archivePrefix }
-    Write-Host "[ROTATE] $displayName $([math]::Round($size/1MB,1)) MB -> $target"
+    Write-Host "[ROTATE] $($archived.Name) $([math]::Round($size/1MB,1)) MB -> $target"
 }
 
 # --- rotate ----------------------------------------------------------

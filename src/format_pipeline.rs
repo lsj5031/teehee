@@ -368,22 +368,24 @@ impl ChannelMixer {
                     }
                 }
                 (n_in, n_out) => {
-                    // Down-mix: average stride of `n_in / n_out`
-                    // input channels into each output channel. The
-                    // remainder `n_in % n_out` is folded into the
-                    // first output channel so averages are
-                    // mass-conserving.
-                    let step = n_in / n_out;
+                    // Down-mix: partition the input channels into n_out
+                    // contiguous groups. The first `n_in % n_out`
+                    // groups get one extra channel, so every input is
+                    // consumed exactly once and no channel is
+                    // duplicated or dropped. For example, 3→2 groups
+                    // [0,1] and [2].
+                    let base = n_in / n_out;
                     let rem = n_in % n_out;
+                    let mut start = 0;
                     for c in 0..n_out {
-                        let start = c * step;
-                        let end = start + step + if c == 0 { rem } else { 0 };
+                        let span = base + if c < rem { 1 } else { 0 };
+                        let end = start + span;
                         let mut acc = 0.0_f32;
                         for j in start..end {
                             acc += input_frames[in_off + j];
                         }
-                        let span = end - start;
-                        out[out_off + c] = if span > 0 { acc / span as f32 } else { 0.0 };
+                        out[out_off + c] = acc / span as f32;
+                        start = end;
                     }
                 }
             }
@@ -780,6 +782,16 @@ mod unit {
         let n = m.process(&input, &mut out);
         assert_eq!(n, 1);
         assert_eq!(out[0], 2.5);
+    }
+
+    #[test]
+    fn mixer_3_to_2_folds_remainder_without_losing_channels() {
+        let m = ChannelMixer::new(3, 2);
+        let input = [0.0_f32, 0.0, 1.0];
+        let mut out = [9.0_f32; 2];
+        let n = m.process(&input, &mut out);
+        assert_eq!(n, 1);
+        assert_eq!(out, [0.0, 1.0], "3→2 must use channels [0,1] then [2]");
     }
 
     #[test]

@@ -198,15 +198,26 @@ pub fn compute_budget(mtu_bytes: usize, channels: u8) -> Result<MtuBudget, MtuEr
     })
 }
 
+impl MtuBudget {
+    /// Largest encoded teehee packet (protocol header + PCM payload)
+    /// that fits after IP and UDP framing. The protocol header is part
+    /// of the encoded packet, so it must be added back exactly once to
+    /// the payload budget.
+    #[inline]
+    pub const fn max_encoded_bytes(&self) -> usize {
+        self.max_payload_bytes + crate::protocol::HEADER_LEN
+    }
+}
+
 /// Decide whether an encoded packet of `encoded_bytes` size overshoots
-/// the budget's `max_payload_bytes`. Used by the send loop to count
+/// the budget's wire envelope. Used by the send loop to count
 /// fragmentation events without re-running the full compute path.
 ///
 /// Returns `true` whenever the encoded packet is one byte too large —
 /// at which point the OS will IP-fragment at the wire.
 #[inline]
 pub const fn exceeds_budget(encoded_bytes: usize, budget: &MtuBudget) -> bool {
-    encoded_bytes > budget.max_payload_bytes
+    encoded_bytes > budget.max_encoded_bytes()
 }
 
 #[cfg(test)]
@@ -402,7 +413,7 @@ mod unit {
             max_payload_bytes: 1447,
             max_chunk_samples: 180,
         };
-        assert!(exceeds_budget(1448, &b));
+        assert!(exceeds_budget(1473, &b)); // one byte past header+payload
         assert!(exceeds_budget(1500, &b));
         assert!(exceeds_budget(7705, &b));
     }
@@ -415,7 +426,10 @@ mod unit {
         };
         assert!(!exceeds_budget(0, &b));
         assert!(!exceeds_budget(25, &b)); // header-only
-        assert!(!exceeds_budget(1447, &b)); // exactly fits
+        assert!(!exceeds_budget(1447, &b)); // header + 1422-byte payload
+        assert_eq!(b.max_encoded_bytes(), 1472);
+        assert!(!exceeds_budget(1472, &b)); // exactly fits
+        assert!(exceeds_budget(1473, &b)); // one byte over
     }
 
     // ----- MtuError Display -----

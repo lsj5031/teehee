@@ -218,6 +218,11 @@ impl JitterBuffer {
     ) -> Self {
         assert!(samples_per_packet > 0, "samples_per_packet must be > 0");
         assert!(capacity_packets > 0, "capacity_packets must be > 0");
+        // Ring slots are indexed with `seq % capacity`. Rounding the
+        // capacity up to a power of two makes that mapping divide the
+        // u32 sequence space evenly, so adjacent sequences never collide
+        // when the stream wraps from u32::MAX to 0.
+        let capacity_packets = capacity_packets.next_power_of_two();
         if let Some(t) = prebuffer_target_frames {
             assert!(t > 0, "prebuffer_target_frames must be > 0 when set");
         }
@@ -245,6 +250,22 @@ impl JitterBuffer {
             resync_floor: None,
             stats: Stats::default(),
         }
+    }
+
+    /// Recompute the prebuffer anchor from the packets still in the
+    /// ring after advancing the retained prebuffer window.
+    fn recompute_min_pushed(&mut self) {
+        let mut min = None;
+        for slot in &self.slots {
+            if slot.filled {
+                min = Some(match min {
+                    None => slot.seq,
+                    Some(prev) if modular_is_earlier_or_equal(slot.seq, prev) => slot.seq,
+                    Some(prev) => prev,
+                });
+            }
+        }
+        self.min_pushed = min;
     }
 
     /// Reset the jitter buffer to prebuffer state, clearing all slots
@@ -353,6 +374,38 @@ impl JitterBuffer {
             }
         }
 
+        // Prebuffer must also fit within one sequence window, not just
+        // one ring's worth of occupied slots. Otherwise a missing packet
+        // can share a slot with retained future audio when playback starts.
+        if self.head.is_none() {
+            if let Some(min) = self.min_pushed {
+                let capacity = self.capacity_packets as u32;
+                if modular_is_earlier_or_equal(seq, min) {
+                    // Reordering may move the anchor backward, but must
+                    // not stretch the window past its newest packet.
+                    if self
+                        .slots
+                        .iter()
+                        .any(|slot| slot.filled && slot.seq.wrapping_sub(seq) >= capacity)
+                    {
+                        self.stats.late_drops += 1;
+                        return PushOutcome::Late;
+                    }
+                } else if seq.wrapping_sub(min) >= capacity {
+                    // Keep the newest ring-sized timeline, including its
+                    // holes. Rebuffer until the retained audio meets the
+                    // gate rather than anchoring on stale samples.
+                    for slot in &mut self.slots {
+                        if slot.filled && seq.wrapping_sub(slot.seq) >= capacity {
+                            slot.filled = false;
+                            self.filled_count -= 1;
+                        }
+                    }
+                    self.recompute_min_pushed();
+                }
+            }
+        }
+
         if let Some(head) = self.head {
             // Mid-read slot collision: if the slot the new seq would
             // land in is the slot the audio callback is currently
@@ -425,7 +478,8 @@ impl JitterBuffer {
         self.slots[idx].samples.copy_from_slice(samples);
         self.slots[idx].filled = true;
 
-        // In prebuffer mode, track the smallest seq so play head can anchor.
+        // The retained prebuffer window is bounded above; track its
+        // earliest packet as the eventual playback anchor.
         if self.head.is_none()
             && self
                 .min_pushed
@@ -1094,6 +1148,80 @@ mod unit {
             result.is_err(),
             "Some(0) must panic — a zero target is nonsensical"
         );
+    }
+
+    #[test]
+    fn capacity_rounds_up_for_wrap_safe_indexing() {
+        // A non-power-of-two request is padded so `seq % capacity`
+        // divides the u32 sequence space evenly.
+        let buf = JitterBuffer::new(4, 3, None);
+        assert_eq!(buf.capacity_packets, 4);
+    }
+
+    #[test]
+    fn prebuffer_anchor_recomputes_after_overwrite() {
+        // Four slots, four-packet gate. Push five packets before the
+        // gate opens; seq 4 overwrites the slot holding seq 0. The
+        // anchor must move to seq 1 (the smallest retained packet),
+        // not keep pointing at overwritten seq 0 and emit silence.
+        let mut buf = JitterBuffer::new(4, 4, Some(16));
+        for seq in 0..=4u32 {
+            let samples = [seq as f32; 4];
+            assert_eq!(buf.push(seq, &samples), PushOutcome::Stored);
+        }
+        let mut out = [99.0_f32; 4];
+        buf.pop_frames(&mut out);
+        assert_eq!(out, [1.0; 4], "anchor must use the smallest retained seq");
+    }
+
+    #[test]
+    fn prebuffer_startup_gaps_keep_a_bounded_timeline() {
+        // 48 kHz stereo, 5 ms packets, prebuffer = ring = 160 ms.
+        // Losing seq 1 and 32 used to leave anchor 0 beside future seq 33,
+        // which was then discarded while playing silence for missing seq 1.
+        let mut buf = JitterBuffer::with_high_water(480, 32, Some(15_360), Some(15_360));
+        let packet = |seq: u32| vec![(seq + 1) as f32; 480];
+        buf.push(0, &packet(0));
+        for seq in 2..=31 {
+            buf.push(seq, &packet(seq));
+        }
+        buf.push(33, &packet(33));
+        assert_eq!(buf.min_pushed, Some(2));
+        assert_eq!(buf.queued_frames(), 31 * 480);
+
+        let mut out = vec![99.0; 480];
+        buf.pop_frames(&mut out);
+        assert_eq!(out, vec![0.0; 480], "wait for a valid prebuffer window");
+        assert!(buf.head.is_none());
+        assert_eq!(buf.push(0, &packet(0)), PushOutcome::Late);
+
+        for seq in 34..=64 {
+            assert_eq!(buf.push(seq, &packet(seq)), PushOutcome::Stored);
+        }
+        buf.pop_frames(&mut out);
+        assert_eq!(out, packet(33), "retained future audio must survive");
+        assert_eq!(buf.push(65, &packet(65)), PushOutcome::Stored);
+        assert_eq!(buf.stats().overrun_resyncs, 0);
+        assert_eq!(buf.stats().silence_insertions, 0);
+    }
+
+    #[test]
+    fn prebuffer_window_handles_wrap_and_out_of_order_packets() {
+        for base in [0u32, u32::MAX - 2] {
+            let mut buf = JitterBuffer::new(1, 4, Some(4));
+            let seq = |offset: u32| base.wrapping_add(offset);
+            for offset in [0, 2, 3, 5] {
+                assert_eq!(buf.push(seq(offset), &[offset as f32]), PushOutcome::Stored);
+            }
+            assert_eq!(buf.min_pushed, Some(seq(2)));
+            assert_eq!(buf.push(seq(1), &[1.0]), PushOutcome::Late);
+            assert_eq!(buf.push(seq(4), &[4.0]), PushOutcome::Stored);
+
+            let mut out = [0.0; 4];
+            buf.pop_frames(&mut out);
+            assert_eq!(out, [2.0, 3.0, 4.0, 5.0]);
+            assert_eq!(buf.stats().silence_insertions, 0);
+        }
     }
 
     // ----- Slice 10 ring_overruns -----

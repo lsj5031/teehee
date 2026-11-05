@@ -103,11 +103,11 @@ fn exceeds_budget_decision_at_stereo_1500() {
     // Header-only (25 B): definitely fits.
     assert!(!exceeds_budget(25, &b));
     // Exactly at the boundary: does NOT count as overrun.
-    // (Encoded size = 1447 B is the largest packet that still
-    // fits inside the envelope.)
-    assert!(!exceeds_budget(b.max_payload_bytes, &b));
+    // max_encoded_bytes() = 1447 payload + 25 header = 1472 B.
+    assert_eq!(b.max_encoded_bytes(), 1472);
+    assert!(!exceeds_budget(b.max_encoded_bytes(), &b));
     // One byte over: counts as overrun.
-    assert!(exceeds_budget(b.max_payload_bytes + 1, &b));
+    assert!(exceeds_budget(b.max_encoded_bytes() + 1, &b));
 }
 
 // ----- Default `chunk_ms = 20` overshoots every LAN MTU -----
@@ -149,7 +149,7 @@ fn default_chunk_ms_20_stereo_payload_overshoots_all_lan_boundary_mtus() {
         !exceeds_budget(encoded.len(), &jumbo),
         "default chunk_ms=20 stereo packet ({} B) fits at MTU=9000 (max {})",
         encoded.len(),
-        jumbo.max_payload_bytes
+        jumbo.max_encoded_bytes()
     );
 }
 
@@ -167,11 +167,11 @@ fn chunk_ms_1_stereo_fits_at_every_boundary_mtu() {
     for &mtu in &[576usize, 1280, 1500, 9000] {
         let b = compute_budget(mtu, 2).expect("valid MTU");
         assert!(
-            encoded.len() <= b.max_payload_bytes,
-            "chunk_ms=1 at MTU={}: encoded {} B > max_payload {} B",
+            encoded.len() <= b.max_encoded_bytes(),
+            "chunk_ms=1 at MTU={}: encoded {} B > max_encoded {} B",
             mtu,
             encoded.len(),
-            b.max_payload_bytes
+            b.max_encoded_bytes()
         );
     }
 }
@@ -204,7 +204,7 @@ fn sender_loop_fragmentation_counter_increments_on_overshoot() {
             chunk_samples,
             440.0,
         );
-        if encoded.len() > budget.max_payload_bytes {
+        if encoded.len() > budget.max_encoded_bytes() {
             fragmentations.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -232,7 +232,7 @@ fn sender_loop_fragmentation_counter_zero_when_packets_fit() {
                 chunk_samples,
                 440.0,
             );
-            if encoded.len() > budget.max_payload_bytes {
+            if encoded.len() > budget.max_encoded_bytes() {
                 fragmentations.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -425,7 +425,7 @@ fn sine_sender_loopback_fragmentations_counter_matches_overshoot_rate() {
                 "encode helper produced an unexpected-sized packet (drift?)"
             );
             // Slice-9 production shape:
-            if encoded.len() > budget.max_payload_bytes {
+            if encoded.len() > budget.max_encoded_bytes() {
                 frag_clone.fetch_add(1, Ordering::Relaxed);
             }
             tx.send(&encoded)

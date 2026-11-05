@@ -228,6 +228,17 @@ impl SingleInstanceGuard {
     }
 }
 
+/// Wall-clock period for one packet containing `chunk_frames` audio
+/// frames. Integer chunk-ms arithmetic truncates the frame count (for
+/// example 44.1 kHz × 3 ms = 132 frames = 2.993197 ms), so pacing by
+/// the nominal chunk duration would create a permanent rate error.
+fn chunk_period(sample_rate: u32, chunk_frames: usize) -> Duration {
+    debug_assert!(sample_rate > 0, "sample_rate must be > 0");
+    debug_assert!(chunk_frames > 0, "chunk_frames must be > 0");
+    let nanos = (chunk_frames as u64).saturating_mul(1_000_000_000) / sample_rate as u64;
+    Duration::from_nanos(nanos.max(1))
+}
+
 struct SendPacer {
     period: Duration,
     next_tick: Instant,
@@ -515,16 +526,17 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         info!(
             mtu_bytes = args.mtu,
             max_payload_bytes = budget.max_payload_bytes,
+            max_encoded_bytes = budget.max_encoded_bytes(),
             max_chunk_samples = budget.max_chunk_samples,
             requested_chunk_ms = chunk_ms,
             requested_chunk_samples,
             requested_payload_bytes,
-            fits_in_mtu = requested_payload_bytes <= budget.max_payload_bytes,
+            fits_in_mtu = requested_payload_bytes <= budget.max_encoded_bytes(),
             "teehee send (--sine): MTU budget anchored; packets larger than \
-             max_payload_bytes will be counted as fragmentations, not \
+             max_encoded_bytes will be counted as fragmentations, not \
              rejected"
         );
-        if requested_payload_bytes > budget.max_payload_bytes {
+        if requested_payload_bytes > budget.max_encoded_bytes() {
             // CAREFUL #1 (slice 9 review): elevate startup log to
             // warn! when the configured chunk-ms × audio-params combo
             // is known to fragment on this MTU. The user can fix
@@ -534,7 +546,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 (budget.max_chunk_samples * 1000) / (sample_rate as usize * channels as usize);
             warn!(
                 packet_bytes = requested_payload_bytes,
-                max_payload_bytes = budget.max_payload_bytes,
+                max_encoded_bytes = budget.max_encoded_bytes(),
                 max_fitting_chunk_ms = max_chunk_ms,
                 "configured --chunk-ms sends packets larger than the MTU \
                  envelope; OS IP-fragmentation will occur for every packet \
@@ -559,13 +571,13 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         let ps = Arc::clone(&packets_sent);
         let frag = Arc::clone(&fragmentations);
         let se = Arc::clone(&send_errors);
-        let max_payload = budget.max_payload_bytes;
+        let max_encoded = budget.max_encoded_bytes();
         let ctrl = control.clone();
         // Dry-run: pure SineSource, no audio_io. Sleep chunk_ms between sends.
         let handle = thread::spawn(move || -> anyhow::Result<()> {
             let mut sine = SineSource::new(sample_rate, channels, 440.0);
             let mut chunk_buf = vec![0.0_f32; chunk_frames * channels as usize];
-            let period = Duration::from_millis(chunk_ms as u64);
+            let period = chunk_period(sample_rate, chunk_frames);
             let mut pacer = SendPacer::new(period);
             let mut seq: u32 = 0;
             let mut last_send_err_log = Instant::now() - Duration::from_secs(60);
@@ -586,7 +598,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 // Slice 9: per-packet MTU fragment-on-overrun accounting.
                 // The OS will IP-fragment if encoded.len() exceeds the
                 // envelope; we count the event instead of dropping.
-                if encoded.len() > max_payload {
+                if encoded.len() > max_encoded {
                     frag.fetch_add(1, Ordering::Relaxed);
                 }
                 // BUG-5 FIX: survive ICMP port-unreachable / conn-refused.
@@ -763,14 +775,15 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             chunk_ms,
             mtu_bytes = args.mtu,
             max_payload_bytes = budget.max_payload_bytes,
+            max_encoded_bytes = budget.max_encoded_bytes(),
             max_chunk_samples = budget.max_chunk_samples,
             requested_chunk_samples = chunk_samples,
             requested_payload_bytes,
-            fits_in_mtu = requested_payload_bytes <= budget.max_payload_bytes,
+            fits_in_mtu = requested_payload_bytes <= budget.max_encoded_bytes(),
             "teehee send: capture source opened; using device's actual format \
              (CLI --sample-rate/--channels apply only to --sine dry-run)"
         );
-        if requested_payload_bytes > budget.max_payload_bytes {
+        if requested_payload_bytes > budget.max_encoded_bytes() {
             // CAREFUL #1 (slice 9 review): elevate startup log to
             // warn! when the configured chunk-ms × device-actual
             // channels combo is known to fragment on this MTU. The
@@ -779,7 +792,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                 (budget.max_chunk_samples * 1000) / (sample_rate as usize * channels as usize);
             warn!(
                 packet_bytes = requested_payload_bytes,
-                max_payload_bytes = budget.max_payload_bytes,
+                max_encoded_bytes = budget.max_encoded_bytes(),
                 max_fitting_chunk_ms = max_chunk_ms,
                 "configured --chunk-ms sends packets larger than the MTU \
                  envelope at {channels} ch {sample_rate} Hz; OS IP-fragmentation \
@@ -788,7 +801,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
                  or raise --mtu to a larger value (e.g. 9000 for jumbo)."
             );
         }
-        let max_payload = budget.max_payload_bytes;
+        let max_encoded = budget.max_encoded_bytes();
 
         // Install the bounded capture ring now that device format is known.
         {
@@ -880,7 +893,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
         // small target fill and stays there — the same algorithm
         // the receiver uses for its jitter buffer.
         let _mmcss = MmcssGuard::acquire();
-        let base_period = Duration::from_millis(chunk_ms as u64);
+        let base_period = chunk_period(sample_rate, chunk_frames);
         let mut pacer = SendPacer::new(base_period);
         // Target fill: at least 2 chunks, minimum 15 ms. The WASAPI
         // delivery sawtooth (batch size ≈ 10-20 ms) makes the ring
@@ -1019,7 +1032,7 @@ fn run_send(args: &SendArgs) -> anyhow::Result<()> {
             let frame_ts = (seq as u64) * chunk_frames as u64;
             let pkt = Packet::new(seq, frame_ts, sample_rate, channels, &chunk_buf);
             let encoded = pkt.encode();
-            if encoded.len() > max_payload {
+            if encoded.len() > max_encoded {
                 fragmentations.fetch_add(1, Ordering::Relaxed);
             }
             // BUG-5 FIX: survive ICMP port-unreachable / conn-refused.
@@ -2104,5 +2117,14 @@ mod unit {
     fn receiver_high_water_never_exceeds_ring_capacity() {
         assert_eq!(receiver_high_water_frames(200, 200, 48_000, 2), 19_200);
         assert_eq!(receiver_high_water_frames(20, 100, 48_000, 2), 9_600);
+    }
+
+    #[test]
+    fn chunk_period_uses_actual_frame_duration() {
+        // 44.1 kHz cannot represent 3 ms as an integer number of frames:
+        // 132 frames last 2.993197 ms. Pacing must use that duration.
+        assert_eq!(chunk_period(44_100, 132).as_nanos(), 2_993_197);
+        assert_eq!(chunk_period(48_000, 960), Duration::from_millis(20));
+        assert_eq!(chunk_period(48_000, 48), Duration::from_millis(1));
     }
 }
