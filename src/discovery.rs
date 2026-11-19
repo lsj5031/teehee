@@ -121,6 +121,63 @@ pub fn resolve_with_timeout(timeout: Duration) -> Result<SocketAddr, ResolutionE
     Err(ResolutionError::Timeout { timeout })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredReceiver {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Browse for every `_teehee._udp.local.` receiver for `timeout` and
+/// return the distinct endpoints. Unlike [`resolve_with_timeout`], this
+/// is for a discovery UI: it collects the whole browse window instead of
+/// stopping at the first answer.
+pub fn discover_all(timeout: Duration) -> Result<Vec<DiscoveredReceiver>, ResolutionError> {
+    struct DaemonGuard(ServiceDaemon);
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            let _ = self.0.shutdown();
+        }
+    }
+
+    let daemon = ServiceDaemon::new().map_err(|e| ResolutionError::Daemon(e.to_string()))?;
+    let daemon = DaemonGuard(daemon);
+    let receiver = daemon
+        .0
+        .browse(SERVICE_TYPE)
+        .map_err(|e| ResolutionError::Daemon(e.to_string()))?;
+    let deadline = Instant::now() + timeout;
+    let mut found: Vec<DiscoveredReceiver> = Vec::new();
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(100));
+        match receiver.recv_timeout(wait) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                let Some(addr) = info.get_addresses().iter().next() else {
+                    continue;
+                };
+                let host = addr.to_string();
+                let port = info.get_port();
+                let fullname = info.get_fullname().trim_end_matches('.');
+                let name = fullname
+                    .strip_suffix("._teehee._udp.local")
+                    .unwrap_or(fullname)
+                    .to_string();
+                if !found.iter().any(|entry| entry.host == host && entry.port == port) {
+                    found.push(DiscoveredReceiver { name, host, port });
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn first_ipv4_from_event(event: ServiceEvent) -> Option<SocketAddr> {
     if let ServiceEvent::ServiceResolved(info) = event {
         info.get_addresses()

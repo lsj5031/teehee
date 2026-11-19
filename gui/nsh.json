@@ -1,0 +1,24 @@
+{
+  "name": "teehee",
+  "id": "dev.teehee.desktop",
+  "version": "0.1.0",
+  "build": 1,
+  "icon": "assets/icon.png",
+  "nsh": ">=0.6",
+  "rust": ".",
+  "theme": "theme.json",
+  "appearance": "system",
+  "singleInstance": true,
+  "tailwind": {
+    "ease": {
+      "ui": [0.23, 1, 0.32, 1]
+    }
+  },
+  "window": {
+    "title": "teehee",
+    "defaultSize": { "width": 1060, "height": 720 },
+    "minSize": { "width": 820, "height": 600 },
+    "titleBar": { "style": "hidden", "height": 44 },
+    "restoreBounds": true
+  }
+}
