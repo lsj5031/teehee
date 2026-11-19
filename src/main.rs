@@ -1622,21 +1622,19 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             .get()
                             .expect("player_cfg_slot must be set by run_recv contract");
                         let samples_per_packet = pkt.payload.len() / 4; // f32 = 4 bytes
-                                                                        // Slice 6 prebuffer gate target — unchanged
-                                                                        // after slice 7/10. The gate compares
-                                                                        // `queued_frames()` (interleaved f32
-                                                                        // SAMPLES) against this value, so both
-                                                                        // sides of the comparison use the
-                                                                        // INPUT-rate × INPUT-channels unit. The
-                                                                        // slice-7 format pipeline runs DOWNSTREAM
-                                                                        // of the gate release, so it does NOT
-                                                                        // affect prebuffer timing.
-                                                                        //
-                                                                        // The validate() cross-flag check at the
-                                                                        // top of run_recv guarantees
-                                                                        // `rx_buffer_ms >= prebuffer_ms`, so
-                                                                        // `capacity_packets` is always >= the gate
-                                                                        // target.
+                        let capacity_packets = match compute_capacity_packets(
+                            rx_buffer_ms,
+                            prebuffer_ms,
+                            pkt.sample_rate,
+                            pkt.channels,
+                            samples_per_packet,
+                        ) {
+                            Ok(capacity) => capacity,
+                            Err(error) => {
+                                warn!(%error, "dropping unsupported receive format");
+                                continue;
+                            }
+                        };
                         let prebuffer_target_frames =
                             (prebuffer_ms * pkt.sample_rate as usize * pkt.channels as usize)
                                 / 1000;
@@ -1648,42 +1646,6 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             pkt.sample_rate,
                             pkt.channels,
                         );
-                        // Slice 10 (Tier 3 #9): explicitly derive
-                        // `capacity_packets` from `--rx-buffer-ms`
-                        // rather than the slice-6 hardcoded
-                        // `max(32, required_packets × 3)`. Operator
-                        // now expresses total ring depth directly
-                        // in ms of audio. The cross-flag validate()
-                        // at the top of run_recv and clap's
-                        // range-check value_parser both gate the
-                        // realized error paths in compute_capacity_packets,
-                        // so an `Err` here is unreachable — log and
-                        // keep the receiver thread alive rather than
-                        // `?` (which would require the closure to
-                        // return a `Result` we don't use elsewhere).
-                        let capacity_packets = match compute_capacity_packets(
-                            rx_buffer_ms,
-                            prebuffer_ms,
-                            pkt.sample_rate,
-                            pkt.channels,
-                            samples_per_packet,
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    rx_buffer_ms,
-                                    prebuffer_ms,
-                                    sample_rate = pkt.sample_rate,
-                                    channels = pkt.channels,
-                                    "rx ring capacity derivation failed; \
-                                     dropping first packet (should be \
-                                     unreachable after run_recv startup \
-                                     validation)"
-                                );
-                                continue;
-                            }
-                        };
                         let jb = JitterBuffer::with_high_water(
                             samples_per_packet,
                             capacity_packets,
@@ -1764,6 +1726,19 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                             || pkt.channels != state.input_channels
                             || spp != state.jb.samples_per_packet()
                         {
+                            let capacity_packets = match compute_capacity_packets(
+                                rx_buffer_ms,
+                                prebuffer_ms,
+                                pkt.sample_rate,
+                                pkt.channels,
+                                spp,
+                            ) {
+                                Ok(capacity) => capacity,
+                                Err(error) => {
+                                    warn!(%error, "dropping unsupported receive format");
+                                    continue;
+                                }
+                            };
                             warn!(
                                 old_rate = state.input_rate_hz,
                                 new_rate = pkt.sample_rate,
@@ -1785,14 +1760,6 @@ fn run_recv(args: &RecvArgs) -> anyhow::Result<()> {
                                 pkt.sample_rate,
                                 pkt.channels,
                             );
-                            let capacity_packets = compute_capacity_packets(
-                                rx_buffer_ms,
-                                prebuffer_ms,
-                                pkt.sample_rate,
-                                pkt.channels,
-                                spp,
-                            )
-                            .unwrap_or(32);
                             let jb = JitterBuffer::with_high_water(
                                 spp,
                                 capacity_packets,

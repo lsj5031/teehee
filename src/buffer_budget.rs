@@ -77,6 +77,9 @@ pub const RX_BUFFER_DEFAULT_MS: usize = 2_000;
 /// memory on a 48 kHz stereo ring (~ 28 MiB at f32 / 30 s × 8 ch).
 pub const RX_BUFFER_MAX_MS: usize = 30_000;
 
+const MAX_RING_PCM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RING_SLOTS: usize = 32_768;
+
 /// Strict-mode validation: the operator's `--rx-buffer-ms` value
 /// could not be accepted — either sub-floor or super-jumbo.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -104,6 +107,14 @@ pub enum BufferError {
         "rx-buffer-ms {rx_buf} must be >= --prebuffer-ms {prebuf}; the \\\n         prebuffer gate target must fit inside the ring it is gating"
     )]
     BufferSmallerThanPrebuffer { rx_buf: usize, prebuf: usize },
+    #[error("unsupported receive format ({sample_rate} Hz, {channels} channels, {samples} samples per packet)")]
+    UnsupportedFormat {
+        sample_rate: u32,
+        channels: u8,
+        samples: usize,
+    },
+    #[error("receive format and buffer duration exceed the jitter ring allocation limit")]
+    RingTooLarge,
 }
 
 /// Range-only validator for the `--rx-buffer-ms` flag. Doesn't
@@ -133,10 +144,8 @@ pub const fn validate_buffer_ms(n: usize) -> Result<usize, BufferError> {
 ///    [`BufferError::TooLarge`] otherwise.
 /// 2. `rx_buffer_ms` must be `>= prebuffer_ms` —
 ///    [`BufferError::BufferSmallerThanPrebuffer`] otherwise.
-/// 3. The derived `rx_buffer_packets_ceil` must be `> 0` — at
-///    default audio formats with stock chunk-ms the answer is
-///    `>= 5` packets, so the zero path is unreachable through
-///    normal validated inputs.
+/// 3. Accept 8–384 kHz audio with 1–32 channels and whole sample frames.
+/// 4. Limit the rounded ring to 32,768 slots and 64 MiB of PCM.
 pub fn compute_capacity_packets(
     rx_buffer_ms: usize,
     prebuffer_ms: usize,
@@ -156,16 +165,34 @@ pub fn compute_capacity_packets(
     // resolution. `samples_per_packet` is typically
     // `chunk_ms * sample_rate * channels / 1000` at 48 kHz
     // stereo / chunk-ms=20 → 1920.
+    if !(8_000..=384_000).contains(&sample_rate_hz)
+        || !(1..=32).contains(&channels)
+        || samples_per_packet == 0
+        || samples_per_packet % usize::from(channels) != 0
+    {
+        return Err(BufferError::UnsupportedFormat {
+            sample_rate: sample_rate_hz,
+            channels,
+            samples: samples_per_packet,
+        });
+    }
     let rx_buffer_frames = rx_buf
         .checked_mul(sample_rate_hz as usize)
         .and_then(|x| x.checked_mul(channels as usize))
-        .map(|x| x / 1000)
-        .unwrap_or(0);
+        .ok_or(BufferError::RingTooLarge)?
+        / 1000;
     let rx_buffer_packets = rx_buffer_frames.div_ceil(samples_per_packet);
     // OS-memory-hygiene floor: never below 32 ring slots so even
     // a very short `--rx-buffer-ms` keeps the reorder window
     // usable on the cpal side.
     let capacity = std::cmp::max(32usize, rx_buffer_packets);
+    let slots = capacity
+        .checked_next_power_of_two()
+        .ok_or(BufferError::RingTooLarge)?;
+    if slots > MAX_RING_SLOTS || samples_per_packet > MAX_RING_PCM_BYTES / size_of::<f32>() / slots
+    {
+        return Err(BufferError::RingTooLarge);
+    }
     Ok(capacity)
 }
 
@@ -259,6 +286,26 @@ mod unit {
         // rx_buffer_packets = ceil(384_000 / 3840) = 100
         let c = compute_capacity_packets(2_000, 200, 96_000, 2, 3_840).unwrap();
         assert_eq!(c, 100);
+    }
+
+    #[test]
+    fn capacity_bounds_format_and_rounded_slot_allocations() {
+        assert!(matches!(
+            compute_capacity_packets(2_000, 200, 48_000, 0, 288),
+            Err(BufferError::UnsupportedFormat { .. })
+        ));
+        assert!(matches!(
+            compute_capacity_packets(2_000, 200, 768_000, 2, 288),
+            Err(BufferError::UnsupportedFormat { .. })
+        ));
+        assert_eq!(
+            compute_capacity_packets(2_000, 200, 48_000, 1, 1),
+            Err(BufferError::RingTooLarge)
+        );
+        assert_eq!(
+            compute_capacity_packets(10_000, 200, 192_000, 8, 12_000),
+            Err(BufferError::RingTooLarge)
+        );
     }
 
     // ----- Cross-flag validation -----
