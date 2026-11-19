@@ -3,8 +3,13 @@ teehee.zip
 /logs/
 .freebuff/
 .grok/
+# generated Python bytecode
+__pycache__/
+
 # local photo-organize helper (not part of teehee)
 organize.py
 organize_run.log
 organized_photos/
 manifest.csv
+scripts/check_library.py
+tests/test_check_library.py
