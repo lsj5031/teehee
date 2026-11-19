@@ -1,0 +1,1015 @@
+# teehee — detailed reference
+
+The in-depth material that used to live in the root README: the wire format,
+every CLI flag, clock-drift compensation, Windows Task Scheduler deployment,
+watchers and log rotation, firewall setup, and a full troubleshooting guide.
+
+For the quick start, screenshots, and the desktop GUI, see the
+[README](../README.md).
+
+---
+
+## What it is
+
+`teehee` is a single Rust CLI binary with three commands:
+
+* `teehee recv` — listen on a UDP port and play incoming audio through the
+  default output device.
+* `teehee send --host <peer-ip>` — capture the Windows default output
+  (loopback) and stream it over UDP. Pass `--mdns` instead of `--host`
+  to auto-resolve a receiver advertising via mDNS on the LAN (slice 12).
+* `teehee devices` — list available audio devices on this machine.
+
+It uses `cpal` for native audio access (WASAPI on Windows, CoreAudio on
+macOS, ALSA on Linux) and a custom raw UDP packet protocol with a 25-byte
+header and f32 PCM payload. No codec, no compression, no daemon, no
+runtime dependencies.
+
+## Wire format
+
+Every packet is a 25-byte fixed little-endian header followed by an
+interleaved f32 PCM payload:
+
+| offset | size | field             |
+|-------:|-----:|-------------------|
+|      0 |    4 | magic = `"TEHE"`  |
+|      4 |    1 | version = `0x01`  |
+|      5 |    4 | sequence (u32)    |
+|      9 |    8 | frame_timestamp (u64) |
+|     17 |    4 | sample_rate (Hz, u32) |
+|     21 |    1 | channels (u8)     |
+|     22 |    1 | sample_format tag |
+|     23 |    2 | payload_len (u16) |
+|     25 |  …  | f32 samples, interleaved |
+
+Each packet is independently interpretable — a receiver can recover from
+startup packet loss without state from prior packets outside the sequence
+number (used by the receiver for jitter reordering).
+
+## Build
+
+```bash
+cargo build --release
+```
+
+The release binary lives at `target/release/teehee.exe` (Windows) or
+`target/release/teehee` (macOS / Linux). It is fully self-contained — no
+runtime, no Python, no PortAudio, no installer.
+
+## Run
+
+### On the Mac (or any Linux/macOS receiver)
+
+```bash
+./teehee recv --port 5000 --prebuffer-ms 200 --rx-buffer-ms 2000 --stats \
+  --log-file logs/recv.jsonl
+```
+
+`--log-file` appends **JSONL** (one JSON object per line) with lifecycle
+events and periodic `recv_stats` / `send_stats` records — ideal for Task
+Scheduler deploys where console output is discarded. Example fields:
+`queued_ms` (live playout delay), `latency_trims`, `capture_ring_ms`,
+`capture_overruns`, `capture_latency_drops`, `send_drift_ppm`. Use with
+or without `--stats` (console tracing).
+
+`--prebuffer-ms` (slice 6) is the *gate*: the receiver waits in
+silence until at least this many ms of audio have accumulated in
+the jitter buffer, then playback starts. After start, fill above
+`prebuffer + 100 ms` is trimmed (packets skipped) so lag cannot silently
+climb toward `--rx-buffer-ms`. The threshold is capped by the configured
+receive-buffer depth. Lower prebuffer for lower first-byte latency (cost:
+more dropouts on shaky networks); raise it for flaky Wi-Fi.
+
+`--rx-buffer-ms` (slice 10) is the *ring depth*: the total buffering
+capacity, expressed in ms of audio. The jitter buffer is sized to
+hold at least this much (bounded by `max(32, packets)` for
+sanity). Default `2000` (= 10× prebuffer), which holds 100 packets
+at 48 kHz stereo / chunk-ms=20 and absorbs typical home-Wi-Fi
+reorders without dropping. Range [100, 30000]: 100 ms is the
+smallest ring that still meets the OS-memory floor; 30 s is the
+largest sane ring without blowing OS memory at high channel
+counts.
+
+**Cross-flag invariant**: `--rx-buffer-ms >= --prebuffer-ms` —
+the gate target can never exceed the ring size, or playback
+would block indefinitely. Passing `--rx-buffer-ms=200
+--prebuffer-ms=500` is rejected at start-up with a clear error
+rather than silently misbehaving.
+
+**Sender bursts drive `ring_overruns`**: when the sender
+out-paces the receiver long enough that the wrapper ring
+reaches an unplayed future slot, the underlying `JitterBuffer`
+overwrites and bumps `ring_overruns` on the receiver's
+`--stats` line. Remediation is either `raise --rx-buffer-ms`
+to grow the ring's `capacity_packets`, or `lower --chunk-ms` on
+the sender to reduce the per-burst pressure. `ring_overruns` is
+distinct from the older `mid_read_collisions` counter (which
+fires only when the cpal callback is currently mid-draining the
+colliding slot — a much rarer signature).
+
+### Windows system-audio loopback sender
+
+```bash
+.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 20 \
+  --capture-source=loopback --stats --log-file logs\send.jsonl
+```
+
+`--chunk-ms` is the encoder packet interval. `20` (= 50 packets/sec) is a
+reasonable starting point; smaller values give lower latency but higher
+packet rate. Default format is 48 kHz stereo f32.
+
+`--capture-buffer-ms` (default `200`) caps the sender’s capture PCM
+ring. If capture briefly outruns encode (loopback burst after idle,
+scheduling stall), the ring **drop-oldest**s so playback never plays
+stale audio.
+
+The sender clock-locks its encode loop to the capture ring. A drift
+compensator (the sender-side mirror of the receiver’s `drift_ppm`)
+measures the ring-fill slope over a 30-second sliding window (the
+same window both sides use — capture and jitter-buffer fills both
+carry low-frequency wander that an 8-second regression would read as
+false slope) and nudges the inter-packet pacing period by ±ppm so
+the ring converges to a small target fill (at least 2 chunks, min
+15 ms) and stays there. This closes the two failure modes of
+wall-clock-only pacing:
+
+* **Capture clock faster than the wall clock** — the ring used to
+  leak upward at the clock skew (e.g. +12 ppm ≈ +0.012 ms/s ≈
+  +260 ms of delay over a 6-hour session), until it hit the
+  `--capture-buffer-ms` cap and drop-oldest caused audible skips.
+  Now the sender drains faster and the ring stays at the target.
+* **Capture clock slower than the wall clock** — the ring used to
+  drain to empty, pops failed, and the sender emitted silence
+  chunks (periodic micro-dropouts). Now the sender slows to match
+  and pops never starve.
+
+After an encode scheduling stall longer than 20 ms (or four chunks),
+the sender keeps only its newest target-depth audio and resets its pacing
+clock. This produces a short content skip instead of forwarding stale
+audio as lasting receiver delay. `capture_latency_drops` counts the
+intentionally discarded samples separately from capacity-driven
+`capture_overruns`. Non-stall capture bursts may still catch up, but at
+most 200 ms is burst-sent before normal pacing resumes until the backlog
+clears. The Windows encode loop also registers for MMCSS `Pro Audio`
+priority to reduce scheduling stalls.
+
+Watch `capture_ring_ms` / `capture_latency_drops` / `capture_overruns` /
+`send_drift_ppm` on `--stats` or in the JSONL log. `send_drift_ppm` is the
+applied pacing correction: near 0 means the capture clock matches the wall
+clock; ±50–200 is typical device skew; ±150 (the clamp) means the tracker
+is saturating — usually right after a capture burst or long pause, and it
+recovers. A permanently high `capture_ring_ms` now means the machine is
+CPU-starved (the encode loop is being preempted), not clock drift.
+
+`--sample-rate` and `--channels` control the format for `--sine` dry-run
+mode only. For real capture (no `--sine`), the cpal / WASAPI device's
+actual sample rate and channel count are used and the CLI values are
+silently overridden (the startup log shows the divergence).
+
+`--mtu` (slice 9) sets the link MTU (default 1500, range [576, 9000]).
+The sender is MTU-aware: it logs the configured MTU, its derived
+`max_payload_bytes` envelope, and the current chunk-ms × audio-params
+packet size at startup so you can see the relationship at a glance. If
+an encoded packet exceeds the envelope, the OS IP-layer fragments it
+transparently — the sender does NOT drop or clamp the packet — and the
+`fragmentations` counter on the `--stats` line increments. A non-zero
+rate means the chunk-ms × audio-params combination is larger than the
+envelope; bump `--mtu` (e.g. to 9000 for a jumbo-frame LAN) or lower
+`--chunk-ms`. Examples:
+
+* `--mtu 576` — IPv6 RFC-minimum link MTU. Forces small packets
+  (~1 ms of audio at stereo).
+* `--mtu 1280` — IPv6 deployment minimum; common on tunnel/VPN paths.
+* `--mtu 1500` — typical Ethernet LAN. The default; matches what
+  `mtu_smoke` and `mtu_boundary_sweep` regression tests pin.
+* `--mtu 9000` — jumbo-frame Ethernet. The default `chunk-ms=20`
+  stereo config still fits (within the envelope) at this size.
+
+`--capture-source=loopback` is the **Windows WASAPI loopback** path (slice 8).
+It captures the default render endpoint with `AUDCLNT_STREAMFLAGS_LOOPBACK`,
+so `teehee` ships whatever is about to play out the speakers — no
+"Stereo Mix" or sound-card loopback-input setup needed. The render
+endpoint's mix format must be IEEE_FLOAT (which is the default on modern
+Windows); legacy PCM-only render endpoints surface a clear error so you
+switch render devices or update teehee for PCM support in a follow-up
+slice.
+
+**Note on loopback timing.** The WASAPI loopback stream can take 5–7
+seconds to produce the first audio data after `start_stream()` — this is
+a Windows audio-engine warm-up characteristic, not a golive bug. During
+this period the sender logs `packets_sent=0`. Additionally, loopback
+capture only generates data while audio is actively being rendered on
+Windows (music, YouTube, games, system sounds). When no audio plays,
+the audio engine goes idle and data stops; it resumes automatically when
+audio starts again. There is no timeout or disconnect — the sender keeps
+polling. If you hear the audio on your headphones instead of the Mac,
+ensure `teehee recv` is running on the Mac side.
+
+For the legacy default-input path on Windows (e.g. capturing a real
+microphone), drop `--capture-source` or pass `--capture-source=default`
+instead. That path requires "Stereo Mix" (or your sound card's loopback
+input) enabled in the sound control panel and marked default.
+
+`--capture-source=auto` (slice 11) probes the OS default input first
+AND, on Windows only, transparently falls back to the WASAPI loopback
+path when the default-input open returns an error. On macOS / Linux
+the loopback fallback is unreachable (slice 8 made `LoopbackCapturer`
+a Windows-only API), so `auto` is functionally identical to
+`default` on those hosts. On a stock Windows desktop with a working
+microphone as the system default input, `auto` will succeed at the
+default-input step and **never reach the loopback fallback** — if you
+need system audio (not microphone audio) on Windows, use
+`--capture-source=loopback` explicitly so the probe order is bypassed
+and you broadcast the render endpoint's mix instead. The `auto`
+helper logs which capture path it landed on (`cpal default input
+(auto-probed)` or `WASAPI loopback (auto-fallback)`) at the startup
+info! line; grep `--stats` for the substring `auto-` to confirm the
+choice.
+
+**Slice-11 strict-mode: `--exact-capture-source` and `TEEHEE_STRICT_LOOPBACK`.**
+Two complementary mechanisms shield operators from the silent-mic
+pitfall on shared / fleet-managed machines where the default-input
+device is unpredictable. They are NOT the same; pick one per
+deployment based on which trade-off fits your workflow:
+
+* **CLI flag: `--exact-capture-source`**. REJECTS `--capture-source=auto`
+  at parse / validate time; the operator MUST type either `default`
+  or `loopback` explicitly. Use this on machines where someone is
+  packaging teehee into a deploy script / config-management recipe
+  and wants to fail loudly at startup if a downstream operator
+  accidentally types `--capture-source=auto`. The flag does not
+  change the value of `--capture-source` itself; it just disallows
+  `auto`. Omitted = off (`--capture-source=auto` parses cleanly, v1
+  back-compat preserved).
+
+  ```bash
+  # This errors at startup with a clear message naming both flags
+  # so the fix is grep-able in logs:
+  .\teehee.exe send --host <peer-ip> --capture-source=auto \
+    --exact-capture-source
+  # error: --exact-capture-source: --capture-source=auto is rejected.
+  # Pass --capture-source=default (or =loopback on Windows) ...
+
+  # This works:
+  .\teehee.exe send --host <peer-ip> --capture-source=loopback \
+    --exact-capture-source
+  ```
+
+* **Env var: `TEEHEE_STRICT_LOOPBACK=1`**. Silently REMAPS
+  `--capture-source=auto` to the WASAPI loopback path on Windows
+  (skipping the default-input probe entirely), or errors on
+  macOS / Linux because the loopback route is Windows-only. The
+  env var does NOT change the parse / validate layer; clap-derived
+  `--capture-source` argument is unchanged. Use this when wrapping
+  teehee in a CI / shell pipeline where you'd rather keep
+  `--capture-source=auto` in the user-facing recipe (so it Just
+  Works on macOS / Linux where `loopback` errors out anyway) and
+  want Linux / Windows servers to silently route the auto path to
+  loopback. The startup info! line shows the strict label
+  (`WASAPI loopback (strict)`) when this env var is the reason
+  auto landed on the loopback path, distinct from the
+  `WASAPI loopback (auto-fallback)` label that fires through the
+  regular auto-probe-and-fail flow on Windows.
+
+  ```bash
+  # Git Bash / MSYS2 on Windows: export the env var, then run
+  export TEEHEE_STRICT_LOOPBACK=1
+  ./teehee.exe send --host <peer-ip> --capture-source=auto --stats
+  # startup info label: WASAPI loopback (strict)
+  ```
+
+  ```powershell
+  # PowerShell: set the env var for the current shell
+  $env:TEEHEE_STRICT_LOOPBACK = "1"
+  .\teehee.exe send --host <peer-ip> --capture-source=auto --stats
+  ```
+
+**Choosing between them**: `--exact-capture-source` is opt-in strict
+(operators MUST type the explicit value; failures are loud);
+`TEEHEE_STRICT_LOOPBACK` is opt-out lenient (the operator can keep
+typing `auto` and the env var silently redirects; failures are
+silent on the happy path). Pick `--exact-capture-source` for packagers
+and CI policies that want to catch configuration drift at parse
+time. Pick `TEEHEE_STRICT_LOOPBACK` for wrappers / dotfiles where the
+script is fine with `auto`, but the host config (default-input
+device unpredictable, fleet-managed / shared rig) needs the
+strict-loopback side-effect. They are independently usable; setting
+both is well-defined (validate layer rejects `auto` first, the env
+var is never consulted).
+
+### Auto-discovery (slice 12)
+
+If you don't want to look up the receiver's IP on the LAN, both sides
+opt in with `--mdns`:
+
+```bash
+# Any receiver (Mac / Linux / Windows) — advertises after UDP bind:
+./teehee recv --port 5000 --mdns --stats
+
+# Any sender — resolves the first matching advert and uses its
+# SRV-derived IP+port:
+./teehee.exe send --mdns --stats
+```
+
+The receiver registers a `_teehee._udp.local.` SRV record through
+`mdns-sd` **after** `Receiver::bind` succeeds, so a port that failed
+to bind is never falsely advertised. The TXT record carries a sparse
+`v=1` protocol-version marker; richer metadata (sample rate,
+channels, codec) lives in the packet header, not in mDNS. The
+advertisement is RAII-held for the lifetime of `run_recv` and
+unregisters cleanly on shutdown.
+
+The sender browses `_teehee._udp.local.` for `--mdns-timeout-ms`
+(default `3000`, range `1`–`60000`) and uses the first resolved IPv4
+SocketAddr. Discovery blocks only **at startup**, never on an audio
+thread, so a slow lookup cannot interrupt playback. On timeout the
+binary exits with a message naming the timeout (so it's greppable
+against `--mdns-timeout-ms`), the looked-up service type, and the
+explicit alternative:
+
+```bash
+./teehee send --mdns
+# mDNS discovery timed out after 3000 ms for _teehee._udp.local.
+# Is the receiver running with --mdns?
+# Try raising --mdns-timeout-ms or pass --host <ip> explicitly.
+```
+
+**Mutual exclusion**: `--mdns` cannot be combined with `--host` or
+the positional `HOST` argument. The error surfaces at the validate
+step (supplied, not deferred), so misuse fails loud before any audio
+work starts:
+
+```bash
+./teehee.exe send --mdns --host 192.168.0.42
+# error: --mdns cannot be combined with --host (or positional HOST)
+
+./teehee.exe send --mdns --mdns-timeout-ms 10000
+# sender logs: teehee send connecting target=192.168.0.42:5000 ...
+# (port comes from the discovered SRV record; --port is unused here)
+```
+
+**When mDNS picks the wrong receiver.** On a LAN with multiple
+running TeeHee receivers, the sender grabs the first advert returned
+by the mDNS browse — there's no selection UI. If you have two or
+more receivers, use `--host` on the sender to point at the
+specific IP you want, or stop the unintended receivers before
+launching `--mdns` mode. Receiver identity / pairing / trust
+selection belongs to a later slice.
+
+### Runtime control (sender)
+
+The sender can accept live control commands over a local TCP socket.
+This is **opt-in and disabled by default** — pass `--control-port` to
+enable:
+
+```bash
+.\teehee.exe send --host <mac-ip> --control-port 9090 \
+  --capture-source=loopback --stats
+```
+
+The control server listens on `127.0.0.1` only (localhost) — no auth
+needed. Binding failure is a hard error (the sender exits with a message
+naming the port), so each sender instance gets its own port.
+
+Connect from another terminal to send commands:
+
+**PowerShell (Windows, no extra tools needed):**
+
+```powershell
+function TeeHee-Control {
+    param([string]$Port = "9090", [string]$Command)
+    $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+    $s = $c.GetStream()
+    $w = New-Object System.IO.StreamWriter($s)
+    $w.WriteLine($Command); $w.Flush()
+    $r = New-Object System.IO.StreamReader($s)
+    $r.ReadLine()
+    $c.Close()
+}
+
+# Usage:
+TeeHee-Control -Command "status"
+TeeHee-Control -Command "pause"
+TeeHee-Control -Command "volume 50"
+TeeHee-Control -Command "resume"
+```
+
+Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `pause` / `p` | Pause streaming (capture continues, packets stop) |
+| `resume` / `r` | Resume streaming (capture ring cleared for fresh audio) |
+| `volume <0-100>` | Set volume as percentage (0=silent, 100=unity) |
+| `v <0-100>` | Same as volume |
+| `gain <0.0-10.0>` | Set gain multiplier (0.0=mute, 1.0=unity, 10.0=max) |
+| `g <0.0-10.0>` | Same as gain |
+| `status` / `s` | Show paused state, gain, and source (manual/system) |
+| `help` / `h` / `?` | List available commands |
+
+`volume` and `gain` without a value print the current setting. The
+`status` output includes `source=manual` or `source=system` to indicate
+whether the gain was set by a control command or by the system-volume
+follower.
+
+**Pause/resume semantics:** while paused, the capture ring is
+continuously cleared so that on resume only fresh audio is sent — no
+stale pre-pause samples are replayed. The receiver sees a silence gap
+bridged by its jitter buffer, then fresh audio starts flowing
+immediately.
+
+#### Follow system volume (`--follow-system-volume`, Windows only)
+
+The `--follow-system-volume` flag polls the Windows system master
+volume every 500 ms and applies it as the sender gain. The system
+volume slider directly controls streamed loudness — no manual control
+commands needed:
+
+```bash
+.\teehee.exe send --host <mac-ip> --capture-source=loopback \
+  --follow-system-volume --stats
+```
+
+Key behaviors:
+
+* **Mute-aware.** When Windows is muted, the stream goes silent. Unmute
+  to resume.
+* **Correct endpoint.** Reads from the `eConsole` render endpoint — the
+  same device that WASAPI loopback captures from.
+* **Immediate start.** The initial volume is read synchronously before
+  the first audio packet is sent, so there is no brief burst at full
+  volume on startup.
+* **Status shows source.** The control `status` command shows
+  `source=system` when the follower is active, so you know a manual
+  `volume` command would be overwritten within 500 ms.
+* **Non-Windows.** The flag is accepted but has no effect; a warning is
+  logged at startup.
+
+### Dry-run / loopback test without hardware
+
+`teehee send --host 127.0.0.1 --sine` generates a 440 Hz tone at the
+default format instead of capturing real audio. Use this to verify the
+receiver on a single machine, or to run the localhost smoke test:
+
+```bash
+# Terminal A
+.\teehee.exe send --host 127.0.0.1 --sine --stats
+# Terminal B
+.\teehee.exe recv --port 5000 --prebuffer-ms 200 --stats
+```
+
+You should see the sender log ~50 packets/sec and the receiver log
+`late_drops=0 duplicates=0 silence_insertions=0` every second.
+
+## Windows deployment (scheduled task)
+
+For a persistent sender that survives reboots and self-heals after a
+crash, run `teehee.exe` **directly** from a Task Scheduler task — no
+bash supervisor, no pid files, no third-party service wrapper. This is
+the supported way to deploy the sender on Windows.
+
+Why not a Windows service? WASAPI loopback capture is *session-bound*:
+it captures the audio rendered in the interactive logon session. A
+service runs in session 0, so it would start cleanly but capture
+silence. Task Scheduler's at-logon trigger runs the task in your
+session — exactly where loopback audio lives. Why not a bash
+supervisor? MSYS2/Git-Bash cannot be launched reliably from Task
+Scheduler's context (the shell dies at DLL-init with exit code 1), and
+a shell loop with pid files and kill-by-name is fragile under system
+resource pressure. The OS already provides supervision primitives; the
+task below is all of them, configured.
+
+### The `TeeHeeSender` task
+
+| Setting | Value | Why |
+|---|---|---|
+| Action | `T:\TeeHee\target\release\teehee.exe send --host <mac-ip> --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200` | The sender is a long-running loop; it needs no supervisor. `--log-file` is what makes a headless task observable (console output is discarded). |
+| Trigger | At logon | Interactive session → WASAPI loopback works. |
+| Trigger | Every 2 minutes (repeating) | Self-heal: if the sender is dead, the next firing restarts it within 2 minutes. |
+| Multiple instances | `IgnoreNew` | A firing while the sender is alive is skipped — never a duplicate stream. |
+| Execution time limit | Disabled (`PT0S`) | A long-running task must not be killed after 72 h. |
+| Start on battery | Allowed | A laptop at logon on battery must still start. |
+| Restart on failure | Every 1 min, up to 3× | Bonus; see the caveat below. |
+| Priority | Normal (`4`) | Audio pacing must not run at Task Scheduler's default below-normal priority. The sender also normalizes itself to `Normal` at startup when changing the task requires elevation. |
+
+### Single-instance guard
+
+`teehee send` holds a named mutex (`Local\TeeHeeSend`). A second
+`teehee send` exits immediately with:
+
+```
+Error: another teehee send instance is already running (single-instance mutex 'Local\TeeHeeSend'); exiting
+```
+
+The kernel destroys the mutex when the owning process exits, so a
+crash never leaves a stale lock — the next launch (or the 2-minute
+trigger) simply takes ownership. This is the native replacement for
+the old supervisor's kill-stale-senders + pid-file logic.
+
+### Re-registering the task
+
+Root-folder task registration requires an **elevated** prompt. Save
+this XML (adjust the `UserId`/SID, paths, and host to your machine),
+then:
+
+```powershell
+schtasks /create /tn TeeHeeSender /xml "C:\path\to\teehee_task.xml" /f
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>MERCURY\lsj50</Author>
+    <Description>teehee sender; runs teehee.exe directly (no bash supervisor). Self-heals via 2-min trigger + restart-on-failure.</Description>
+    <URI>\TeeHeeSender</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-1767847710-1798288265-1333515972-1001</UserId>
+      <LogonType>InteractiveToken</LogonType>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <Priority>4</Priority>
+    <RestartOnFailure>
+      <Count>3</Count>
+      <Interval>PT1M</Interval>
+    </RestartOnFailure>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>true</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+  </Settings>
+  <Triggers>
+    <LogonTrigger>
+      <UserId>MERCURY\lsj50</UserId>
+    </LogonTrigger>
+    <TimeTrigger>
+      <StartBoundary>2026-08-23T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT2M</Interval>
+      </Repetition>
+    </TimeTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>T:\TeeHee\target\release\teehee.exe</Command>
+      <Arguments>send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+To get your user's SID for the `<UserId>` element (or to confirm the
+task runs as you): `whoami /user`. The `StartBoundary` of the
+repeating trigger is when the 2-minute cadence anchors; it repeats
+indefinitely (no `Duration` = never stops).
+
+### Verifying
+
+```powershell
+schtasks /query /tn TeeHeeSender /v /fo LIST
+# Status: Running, Last Result: 267009 (SCHED_S_TASK_RUNNING) — healthy
+
+tasklist | findstr teehee
+# teehee.exe ...
+
+# Sender health lives in the JSONL log (one send_stats line per second):
+Get-Content T:\TeeHee\logs\send.jsonl -Tail 1
+```
+
+`Last Result 267009` while running is healthy; `1` means the last
+start failed (check the exe path and the log). While the task is
+running, an *ignored* 2-minute firing can surface
+`SCHED_E_USER_NOT_LOGGED_ON` (`0x80041320`) as the last result — that
+is cosmetic (the firing was skipped because the task was already
+running) and clears on the next real start.
+
+Task lifecycle events — start, fail, restart, and skipped (already
+running) firings — are recorded in the
+`Microsoft-Windows-TaskScheduler/Operational` event log (enabled):
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddMinutes(-10)} |
+  Where-Object { $_.Message -match 'TeeHee' } | Format-List TimeCreated, Id, Message
+```
+
+### Caveat: Restart on failure
+
+Task Scheduler's "Restart on failure" does **not** fire for
+run-only-when-logged-on (`InteractiveToken`) tasks — a documented
+limitation. The 2-minute periodic trigger is the real self-heal
+mechanism and is verified to restart a killed sender within 2 minutes.
+The `RestartOnFailure` setting is kept as a harmless bonus.
+
+### Monitoring and alerting
+
+`logs/send.jsonl` is the monitoring surface: `send_start` on launch,
+then a `send_stats` record every second with `packets_sent`,
+`packets_per_sec`, `send_errors`, `capture_ring_ms`, and
+`send_drift_ppm`.
+
+`scripts/send_watch.ps1` is the operator's single alerting entry
+point, with two modes:
+
+* `-Watch` (default) — interactive foreground watcher: polls
+  `send.jsonl` every 10 s and alerts on state transitions (ring fill,
+  drift saturation, silent sender). Run via `just watch-send`.
+* `-Check` — one-shot health check for the `TeeHeeWatch` scheduled
+  task (every 5 min). Alerts only on NEW problems and recoveries
+  (state kept in `logs/send_watch.state`), so a stuck sender alerts
+  once, not every 5 minutes.
+
+Alerts append a timestamped line to `logs/send_alerts.log`, play an
+audible alert, and (in `-Check` mode) best-effort pop a message box.
+The watcher also alerts once when `capture_nonzero_samples` has not
+changed for 4 hours. WASAPI loopback stops producing data when the PC
+is idle, so this is informational unless audio should be playing; the
+alert recovers when non-silent samples resume or the sender restarts. Set
+`-CaptureQuietHours 0` to disable it or pass another hour threshold.
+Repeated drift-saturation transitions are rate-limited to one alert
+per 6 hours by default (`-DriftAlertCooldownMinutes 360`), while a
+sustained saturation remains a single active condition. Drift
+saturation is only alerted while non-silent audio has been captured
+within the last 2 minutes (`-DriftQuietSuppressSecs 120`): the
+compensator saturating while the capture engine is silent or idle is
+expected (ring drained, nothing streaming) and is suppressed, so
+these benign audio start/stop transitions do not page the operator.
+
+The "sender down" check uses a 240 s stale threshold: the sender task
+self-heals within ~2 min, so stats older than 4 min mean self-healing
+has failed and the operator should look (`schtasks /run /tn
+TeeHeeSender` starts it manually).
+
+The `TeeHeeWatch` task runs `wscript.exe
+T:\TeeHee\scripts\send_watch_task.vbs` every 5 minutes. The VBScript
+launcher starts `send_watch.ps1 -Check` with `windowStyle 0` and waits
+for it, so neither the launcher nor PowerShell can flash a console
+window in the interactive session. It is PowerShell, not bash — Git
+Bash cannot be launched from Task Scheduler (the reason the sender
+task runs the exe directly), and PowerShell is native and
+task-launchable.
+
+For a manual foreground run of the sender (debugging), `just sender`
+runs the same command as the task.
+
+### Scheduled task installation
+
+All three monitoring tasks use VBScript launchers (`*.vbs`) so that
+neither the launcher nor PowerShell flashes a console window in the
+interactive session. Register them from an **elevated** prompt once
+per machine:
+
+```powershell
+# TeeHeeWatch: runs send_watch.ps1 -Check every 5 min (sender health)
+just install-watch
+
+# TeeHeeWatchdog: runs send_watchdog.ps1 every 10 min (watcher health)
+just install-watchdog
+
+# TeeHeeRotate: runs rotate_logs.ps1 daily (log size cap + archive prune)
+just install-rotate
+```
+
+Tasks run as the **installing user** with highest privileges (`/RL
+HIGHEST`) — not as `SYSTEM`. This is intentional: `msg.exe` desktop
+popups and `SystemSounds` alerts require an interactive session,
+which session-0 (`SYSTEM`) would swallow.
+
+### Watchdog (watcher-of-the-watcher)
+
+`scripts/send_watchdog.ps1` is a second-line defense. If the
+`TeeHeeWatch` task itself is disabled, its trigger breaks, or
+PowerShell is broken, the sender would go unmonitored indefinitely.
+The watchdog checks `logs/send_watch.heartbeat` (written by every
+`send_watch.ps1` run) and alerts if it goes stale beyond 15 min
+(`$StaleSecs = 900`):
+
+* A **stale heartbeat** (timestamp older than 15 min) triggers an
+  alert via the same channels (alerts log, sound, msg.exe popup).
+* A **missing heartbeat** is given the same 15-min grace period
+  (anchored by a `logs/send_watchdog.grace` sentinel) so the first
+  watchdog firing — before `TeeHeeWatch` has written the heartbeat —
+  does not false-alert. After the grace window, a still-missing file
+  means `TeeHeeWatch` was never installed or has been removed.
+* A **corrupt heartbeat** (non-numeric content) is treated as stale
+  with `age=unknown`; the alert still fires.
+
+### Log rotation
+
+`scripts/rotate_logs.ps1` caps log sizes so `send.jsonl` cannot grow
+unbounded (~150 MB/month). The `TeeHeeRotate` task runs it daily:
+
+* When `logs/send.jsonl` exceeds 100 MB (`$MaxSendMb`), it is
+  **copy-and-truncated**: the contents are copied to
+  `logs/archive/send-<timestamp>.jsonl`, then the live file is
+  truncated in place. The sender holds a process-lifetime append
+  handle on `send.jsonl` and never reopens by path, so a rename would
+  send future writes into the archive and the live file would never
+  be recreated. Copy-and-truncate keeps the sender writing at the
+  live path while the archive preserves the rotated data.
+* `logs/send_alerts.log` is rotated the same way at 1 MB
+  (`$MaxAlertMb`).
+* Archives are pruned: only the 8 newest (`$KeepArchives`) are kept,
+  and anything older than 90 days (`$RetainDays`) is deleted.
+
+## Firewall configuration
+
+v1 sends **UDP only**, port `5000` by default. Both sides need the port
+open:
+
+### Windows (sender side)
+
+Windows Defender Firewall may block inbound responses or outbound UDP on
+first launch. Two options:
+
+1. Allow on prompt — when you first run `.\teehee.exe`, Windows shows the
+   firewall prompt. Tick both "Private" and "Domain" networks.
+2. Pre-authorize in PowerShell (admin):
+   ```powershell
+   New-NetFirewallRule -DisplayName "teehee send (UDP out)" `
+     -Direction Outbound -Protocol UDP -RemotePort 5000 -Action Allow
+   ```
+
+If your network is "Public," inbound rules are stricter — switch the
+network profile to *Private* in *Settings → Network & Internet → Properties*,
+or use `--host` with an IP that doesn't trigger Windows Network Discovery
+prompts.
+
+### macOS (receiver side)
+
+macOS Application Firewall blocks unsolicited inbound UDP by default.
+Allow `teehee` listening:
+
+1. *System Settings → Network → Firewall → Options…*
+2. Click `+`, navigate to the `teehee` binary, set *Allow incoming
+   connections*.
+3. Or in Terminal:
+   ```bash
+   sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add /path/to/teehee
+   sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblock /path/to/teehee
+   ```
+
+The receiver binds on `0.0.0.0:5000` so it accepts UDP from any
+interface once the firewall allows it.
+
+### Test connectivity
+
+From the Windows sender, before running the full pipeline, verify the
+macOS receiver is reachable:
+
+```powershell
+Test-NetConnection -ComputerName <mac-ip> -Port 5000
+```
+
+You should see `TcpTestSucceeded: True` only if something is listening
+for TCP on that port; this is a coarse IP/DNS/firewall sanity check, not
+a proof that UDP audio packets can pass. The real UDP proof is running
+`teehee recv --stats` and watching packets arrive from the sender.
+
+## Finding peer IPs
+
+### Mac's IP (from the Mac)
+
+* *System Settings → Wi-Fi → Details… → TCP/IP → IPv4 Address* — most
+  reliable.
+* Or in Terminal: `ipconfig getifaddr en0` (Wi-Fi) or
+  `ipconfig getifaddr en1` (Ethernet / Thunderbolt bridge).
+
+### Windows PC's IP (from the PC)
+
+* `ipconfig` in cmd.exe — look for the active interface's `IPv4 Address`
+  under the heading for Wi-Fi or Ethernet.
+* Or `Get-NetIPAddress -AddressFamily IPv4 -PrefixOrigin Dhcp |
+  Select-Object IPAddress` in PowerShell.
+
+### Both — `teehee devices`
+
+`teehee devices` lists cpal-reported audio endpoints on the current
+machine. Useful for confirming the OS sees your sound card before you
+debug a streaming issue.
+
+## Trusted-LAN limitations
+
+v1 traffic is **not encrypted** and **not authenticated**. Anyone on the
+same LAN who can reach the receiver's UDP port can inject audio (which
+the receiver will dutifully play out the speakers) or sniff the wire.
+Use only on a network you control and trust. **Do not** expose the
+receiver port to the public internet.
+
+## Non-goals (v1)
+
+* AirPlay / RAOP compatibility.
+* Mobile clients (iOS / Android).
+* Tray / menu-bar integration (a windowed GUI prototype now lives in
+  [`gui/`](../gui/); the startup-to-tray appliance flow is still planned).
+* Encryption or authentication.
+* Opus / FLAC / AAC / other compression.
+* Ultra-low-latency gaming or live-performance use.
+* Fan-out (one sender to many receivers).
+* Audio/video sync with remote video playback.
+* Recording or saving audio to disk.
+* Windows WASAPI loopback on macOS / Linux (slice 8 ships Windows-only;
+  macOS / Linux callers fall back to cpal default-input + a virtual input
+  device, or `--sine`).
+* Render-endpoint PCM-only support (slice 8 ships IEEE_FLOAT only; legacy
+  render endpoints surface a clear error to switch devices).
+
+## 10-minute LAN acceptance test
+
+Before considering the build "good enough," run this on your real LAN:
+
+1. Plug a Windows PC + Mac into the same switch / Wi-Fi.
+2. On the Mac: `./teehee recv --port 5000 --prebuffer-ms 200 --stats`.
+3. On the Windows PC:
+   `.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 20 --stats`.
+4. Play any continuous audio source on Windows that is **not** a
+   microphone — browser, Spotify, YouTube, system beeps, anything that
+   exercises the loopback path — for ten minutes.
+5. Verify:
+   * Sender's `packets_sent` counter increases by ~50/sec steadily.
+   * Receiver's `late_drops`, `duplicates`, `silence_insertions` stay at
+     0 or low single digits throughout the run.
+   * Listening on the Mac's default output, the audio matches the
+     sender's source audibly with at most tolerable glitches on a
+     typical home Wi-Fi network.
+   * No crashes, no panics, the receiver still responds to Ctrl+C
+     cleanly.
+
+v1 is considered usable when there is no steady buffer drift, no crash,
+and only tolerable glitches. If the receiver logs show drift
+(`silence_insertions > 0` accumulating minute-over-minute), raise
+`--prebuffer-ms` on the receiver. If `late_drops > 0` rises, raise
+`--chunk-ms` on the sender (bigger packets, fewer per second, less
+network pressure).
+
+### Low-latency recipe
+
+For LAN setups where you want minimal delay between the sender and
+receiver:
+
+```bash
+# Receiver (Mac / Linux) — low-latency settings
+./teehee recv --port 5000 --prebuffer-ms 40 --rx-buffer-ms 300 --stats
+
+# Sender (Windows) — small chunks for lower per-packet latency
+.\teehee.exe send --host <mac-ip> --port 5000 --chunk-ms 5 \
+  --capture-source=loopback --stats
+```
+
+`--prebuffer-ms 40` waits only 40 ms before playback starts (vs the
+default 200 ms). `--rx-buffer-ms 300` keeps the ring shallow. The
+sender's `--chunk-ms 5` sends 200 packets/sec with 5 ms of audio per
+packet — the receiver sees each packet almost immediately. The trade-off:
+shaky Wi-Fi will produce more dropouts; raise both values if you hear
+glitches.
+
+### Underrun resync (`underrun_resyncs`)
+
+When the receiver's jitter buffer empties mid-playback (network stall,
+OS scheduling hiccup, or deliberate pause), the play head **freezes**
+instead of advancing through silence indefinitely. The buffer reverts
+to prebuffer mode and re-accumulates audio until the `--prebuffer-ms`
+gate is met again, then resumes playback at the new anchor point. This
+means a brief network gap is bridged automatically — you'll see
+`underrun_resyncs` increment on the `--stats` line, and playback
+continues seamlessly once packets start flowing again. A permanently
+high `underrun_resyncs` count means the network is dropping packets
+frequently; raise `--prebuffer-ms` or move to a wired connection.
+
+### Sender ICMP resilience
+
+The sender now survives transient ICMP port-unreachable or
+connection-refused errors (common when the receiver isn't running yet,
+or during brief network reconfigurations). Instead of crashing, it
+increments the `send_errors` counter on the `--stats` line and
+continues sending. The error is logged at most once per second to
+avoid log spam. Other send errors (e.g. socket closed) still abort.
+
+### Receiver format change handling
+
+If the sender's audio format changes mid-stream (e.g. switching from
+48 kHz stereo to 44.1 kHz mono), the receiver detects the divergence
+and rebuilds its jitter buffer and format pipeline automatically. The
+rebuild is logged once with the old and new values; subsequent packets
+in the new format flow through the new pipeline. No restart needed.
+
+**Note on output device rate.** The receiver opens its output device
+at the OS default rate. If the sender's rate differs, a real-time
+resampler reconciles the two. A future version may open the output
+device at the sender's rate when supported (device-rate matching),
+eliminating the resampler overhead entirely.
+
+### Clock-drift compensation (`drift_ppm`, `drift_slope`)
+
+Sender and receiver audio crystals differ by ±50–200 ppm. When
+nominal rates match (both 48 kHz), the resampler is bypassed and
+drift accumulates silently: sender-faster → buffer grows → periodic
+packet-skip clicks; receiver-faster → buffer drains → underrun
+freeze + full prebuffer re-fill (~200 ms silence).
+
+The receiver tracks the jitter-buffer fill level and corrects its
+resampler. The sender has its own compensator (see
+`--capture-buffer-ms` above): it tracks the capture-ring fill and
+corrects its pacing period, so the sender's packet rate tracks the
+capture device's clock — the receiver only ever sees the residual
+mismatch, which its own tracker absorbs.
+
+The receiver now tracks the jitter-buffer fill level over a 30-second
+sliding window, computes the fill slope via least-squares linear
+regression, and derives a rate-correction factor (`drift_ppm`) that
+nudges the resampler's step size to keep the buffer at its target
+fill. Two terms contribute:
+
+* **Slope term** — if the buffer is growing at `m` frames/sec, the
+  correction is `(m / nominal_rate) × 1 000 000` ppm. This directly
+  counteracts the crystal skew.
+* **Proportional term** — gently pulls the buffer back toward the
+  prebuffer target. Gain `kp = 0.08` gives a time constant of
+  ≈ 260 s at 48 kHz; 95 % settled in ≈ 13 min.
+
+Both terms are normalised to *audio frames* (interleaved samples ÷
+channel count) so the correction is channel-count–agnostic — stereo
+and mono streams produce the same ppm for the same fill drift.
+The total correction is clamped to ±150 ppm (0.015 % step change —
+inaudible per callback) and slew-limited to 0.5 ppm per callback.
+
+The fill signal is EMA-smoothed (τ ≈ 330 ms) before the regression
+so packet-arrival burstiness is not read as false slope, and the
+tracker resets when the raw fill jumps by more than 30 ms between
+callbacks — a sender burst (the sender's bounded catch-up delivers
+up to 200 ms of packets at once) or a large callback drain — or on
+underrun. Without the burst reset, a one-off fill step pins the
+correction at the clamp for the whole window and then overshoots
+(observed on the LAN: `drift_ppm` pinned at +150 for ~10 s after a
+burst, then flipping to −87).
+
+On `--stats`, watch:
+
+* `drift_ppm` — the applied correction. Near 0 means crystals are
+  matched; ±50–200 is typical LAN drift. ±150 (the clamp) means the
+  tracker is saturating — likely right after a burst, stall, or
+  long pause, not real skew; it recovers.
+* `drift_slope` — the raw fill slope in frames/sec. Positive =
+  buffer growing (sender faster); negative = draining (receiver
+  faster).
+
+After an underrun (`underrun_resyncs` increments), the drift tracker
+resets automatically — the fill cliff and rebuffer ramp would
+otherwise corrupt the regression window. After a latency trim
+(`latency_trims` increments), one drift update is skipped to avoid
+poisoning the slope with the fill discontinuity.
+
+## Troubleshooting
+
+### Receiver hears nothing
+
+1. Confirm `teehee recv` is running and printed
+   `listening on 0.0.0.0:5000`.
+2. Confirm the sender can reach the receiver port
+   (`Test-NetConnection -Port 5000` from PowerShell, or `nc -u -z
+   <mac-ip> 5000` from the Mac).
+3. Check the receiver startup log for `format_conversion_active`. The
+   receiver anchors its jitter buffer from the **first packet's**
+   sample_rate / channels, then converts to the local output device's
+   format when needed. If you hear silence, verify the sender is still
+   emitting non-empty f32 packets and that the receiver opened the
+   expected output device.
+4. Wait 5–10 seconds after starting the sender — the WASAPI loopback
+   engine takes 5–7 seconds to start producing data. Check `--stats` for
+   `packets_sent` increasing.
+5. For `--capture-source=loopback`: audio must be actively playing on
+   Windows (music, YouTube, system sounds). The loopback engine goes
+   idle when no audio is rendered and resumes automatically when audio
+   starts.
+6. Check the firewall instructions above.
+
+### Sender reports `connect failed` immediately
+
+* Confirm the destination host resolves. `--host 127.0.0.1` is always
+  valid; for remote peers, use the IP not the hostname unless DNS is
+  set up. Either the positional `HOST` argument or the `--host` flag
+  is accepted (not both); the `host:port` form (e.g.
+  `--host 192.168.0.10:6000`) embeds the port and rejects an
+  accompanying `--port 6000` as "ambiguous port" rather than silently
+  doubling into `192.168.0.10:6000:6000`.
+* Confirm the receiver is bound on the target port
+  (`ss -ulnp 'sport = :5000'` on Linux/macOS, `Get-NetUDPEndpoint
+  -LocalPort 5000` on Windows).
+
+### Receiver cpal errors
+
+cpal formats vary by OS. On a headless Windows server with no audio
+device, `teehee recv` will exit at startup with a cpal "no output
+device" message — expected, harmless, run it on a machine with speakers.
+
+---
+
+See `tests/` for the test suite. Run `cargo test` to validate the build
+end-to-end.
