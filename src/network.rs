@@ -7,7 +7,7 @@
 //! and serialization; the `network` module owns transport.
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 
 /// Send UDP datagrams to a single target.
 ///
@@ -23,11 +23,33 @@ impl Sender {
     /// Bind an ephemeral local socket and connect it to `target`.
     ///
     /// `target` is resolved via [`std::net::ToSocketAddrs`], so a
-    /// `SocketAddr` or "host:port" string both work.
+    /// `SocketAddr`, `"host:port"`, or `"[::1]:port"` all work.
+    /// IPv4 addresses are tried first to preserve dual-stack hostname behavior.
     pub fn connect(target: impl ToSocketAddrs) -> io::Result<Self> {
-        let socket = UdpSocket::bind(("0.0.0.0", 0))?;
-        socket.connect(target)?;
-        Ok(Self { socket })
+        let mut addresses: Vec<_> = target.to_socket_addrs()?.collect();
+        addresses.sort_by_key(SocketAddr::is_ipv6);
+
+        let mut last_error = None;
+        for addr in addresses {
+            let local_ip = match addr {
+                SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            };
+            match UdpSocket::bind((local_ip, 0)).and_then(|socket| {
+                socket.connect(addr)?;
+                Ok(Self { socket })
+            }) {
+                Ok(sender) => return Ok(sender),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "could not resolve to any addresses",
+            )
+        }))
     }
 
     /// Send `payload` as a single UDP datagram. Returns the number of

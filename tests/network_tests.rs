@@ -1,7 +1,8 @@
 //! Integration tests for the `network` module — exercise the public
 //! `Sender` / `Receiver` interface through real loopback UDP sockets.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::time::Duration;
 
 use teehee::network::{Receiver, Sender};
 
@@ -23,6 +24,46 @@ fn sender_to_receiver_round_trips_a_small_packet() {
     let m = rx.recv(&mut buf).expect("recv");
     assert_eq!(m, payload.len());
     assert_eq!(&buf[..m], payload);
+}
+
+fn assert_round_trip(rx: &Receiver, target: impl ToSocketAddrs) {
+    let tx = Sender::connect(target).expect("connect sender");
+    let payload = b"teehee destination roundtrip";
+    assert_eq!(tx.send(payload).expect("send"), payload.len());
+
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        rx.recv_timeout(&mut buf, Duration::from_secs(1))
+            .expect("recv"),
+        Some(payload.len()),
+    );
+    assert_eq!(&buf[..payload.len()], payload);
+}
+
+#[test]
+fn sender_supports_ipv6_socket_addresses_and_literals() {
+    let rx = Receiver::bind((Ipv6Addr::LOCALHOST, 0)).expect("bind IPv6 receiver");
+    let rx_addr = rx.local_addr().expect("receiver local_addr");
+
+    assert_round_trip(&rx, rx_addr);
+    assert_round_trip(&rx, rx_addr.to_string());
+}
+
+#[test]
+fn sender_accepts_localhost_for_an_ipv4_receiver() {
+    let rx = Receiver::bind(loopback_any_port()).expect("bind IPv4 receiver");
+    let port = rx.local_addr().expect("receiver local_addr").port();
+
+    assert_round_trip(&rx, format!("localhost:{port}"));
+}
+
+#[test]
+fn sender_prefers_ipv4_even_when_ipv6_resolves_first() {
+    let rx = Receiver::bind(loopback_any_port()).expect("bind IPv4 receiver");
+    let ipv4_addr = rx.local_addr().expect("receiver local_addr");
+    let ipv6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), ipv4_addr.port());
+
+    assert_round_trip(&rx, &[ipv6_addr, ipv4_addr][..]);
 }
 
 #[test]
