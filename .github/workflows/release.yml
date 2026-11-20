@@ -199,7 +199,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev pkg-config \
-            libgtk-4-dev libwebkitgtk-6.0-dev \
+            libasound2-dev libgtk-4-dev libwebkitgtk-6.0-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       - name: Package GUI (macOS)
