@@ -135,10 +135,128 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # Native desktop bundles for the NSH GUI prototype. NSH builds the runner
+  # for the machine it runs on, so each OS packages its own architecture.
+  # Settings follow NSH's own CI (macos-15 / ubuntu-24.04 / windows-latest)
+  # and https://nsh.dev/docs/packaging.
+  build-gui:
+    name: build GUI (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-15
+            target: macos
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: macos
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: linux
+          - name: windows-x86_64
+            os: windows-latest
+            target: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version label
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gui-${{ matrix.name }}
+
+      - name: Install NSH (macOS / Linux)
+        if: runner.os != 'Windows'
+        env:
+          NSH_VERSION: v0.6.0
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install NSH (Windows)
+        if: runner.os == 'Windows'
+        env:
+          NSH_VERSION: v0.6.0
+        shell: pwsh
+        run: |
+          irm https://nsh.dev/install.ps1 | iex
+          "$env:LOCALAPPDATA\nsh\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config \
+            libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Package GUI (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          nsh package gui --target macos \
+            --app-version "${VERSION#v}" --build "$GITHUB_RUN_NUMBER" \
+            -o gui-dist
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            "gui-dist/teehee.app" \
+            "dist/teehee-gui-${VERSION}-${{ matrix.name }}.zip"
+
+      - name: Package GUI (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          nsh package gui --target linux \
+            --app-version "${VERSION#v}" --build "$GITHUB_RUN_NUMBER" \
+            -o gui-dist
+          mkdir -p dist
+          cp gui-dist/teehee.tar.gz \
+            "dist/teehee-gui-${VERSION}-${{ matrix.name }}.tar.gz"
+
+      - name: Package GUI (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          RUST_MIN_STACK: "268435456"
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          nsh package gui --target windows \
+            --app-version "${VERSION#v}" --build "$GITHUB_RUN_NUMBER" \
+            -o gui-dist
+          mkdir -p dist
+          cp gui-dist/teehee.zip \
+            "dist/teehee-gui-${VERSION}-${{ matrix.name }}.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: teehee-gui-${{ steps.meta.outputs.version }}-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
   github-release:
     name: create GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, build-gui]
     runs-on: ubuntu-latest
     permissions:
       contents: write

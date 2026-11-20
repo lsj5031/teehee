@@ -106,12 +106,17 @@ audio / microphone / test tone) — no silent `auto` mode.
   </tr>
 </table>
 
-To run it (requires the `nsh` CLI):
+To run it from source (requires the `nsh` CLI):
 
 ```bash
 cd gui
 nsh run App.tsx
 ```
+
+Each GitHub release also carries native GUI bundles built by CI: a macOS
+`.app` (arm64 and Intel), a Linux `.tar.gz`, and a portable Windows `.zip`.
+They carry the same mock session as the source build, so treat them as
+previews of the interface rather than a replacement for the CLI.
 
 ## How it works
 
