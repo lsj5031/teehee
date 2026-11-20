@@ -163,7 +163,10 @@ pub fn discover_all(timeout: Duration) -> Result<Vec<DiscoveredReceiver>, Resolu
                     .strip_suffix("._teehee._udp.local")
                     .unwrap_or(fullname)
                     .to_string();
-                if !found.iter().any(|entry| entry.host == host && entry.port == port) {
+                if !found
+                    .iter()
+                    .any(|entry| entry.host == host && entry.port == port)
+                {
                     found.push(DiscoveredReceiver { name, host, port });
                 }
             }

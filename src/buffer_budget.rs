@@ -168,7 +168,7 @@ pub fn compute_capacity_packets(
     if !(8_000..=384_000).contains(&sample_rate_hz)
         || !(1..=32).contains(&channels)
         || samples_per_packet == 0
-        || samples_per_packet % usize::from(channels) != 0
+        || !samples_per_packet.is_multiple_of(usize::from(channels))
     {
         return Err(BufferError::UnsupportedFormat {
             sample_rate: sample_rate_hz,
