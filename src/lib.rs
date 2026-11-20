@@ -24,7 +24,7 @@
 //! * [`capture_ring`] — bounded sender capture buffer with catch-up
 //!   signalling (prevents permanent encode backlog / lag).
 //! * [`jsonl_log`] — optional append-only JSONL structured logger
-//!   (`--log-file`) for Task Scheduler / production deploys.
+//!   (`--log-file`) for unattended / post-mortem use.
 //! * [`cli`]      — clap-derived CLI types.
 //! * [`discovery`] — slice-12 mDNS auto-discovery (opt-in `--mdns`
 //!   on both sides).
@@ -44,6 +44,7 @@ pub mod loopback;
 pub mod mtu_budget;
 pub mod network;
 pub mod protocol;
+pub mod single_instance;
 
 pub use loopback::LoopbackCapturer;
 pub use protocol::{Packet, SampleFormat, HEADER_LEN, MAGIC, VERSION};

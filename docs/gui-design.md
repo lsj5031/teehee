@@ -966,10 +966,11 @@ imports, so the sidecar→embedded switch touches one module.
 2. **Is refactoring `main.rs` into `teehee::session` acceptable?** If not, M6
    slips indefinitely and the app ships with sidecar quirks. Recommendation:
    accept the refactor; it also makes the engine testable.
-3. **Should the GUI replace the Task Scheduler recipe entirely?** If yes,
-   "Open at login" and "Reconnect" must be excellent, and the app should
-   surface the existing `Local\TeeHeeSend` mutex state. Recommendation: yes for
-   interactive desktops, keep the task recipe for headless/fleet machines.
+3. **Should the GUI replace the Task Scheduler recipe entirely?** Decided:
+   yes, for this app. "Open at login", auto-start and reconnect are in
+   Settings, and the app takes the existing `Local\TeeHeeSend` mutex state
+   itself. The task recipe is removed; headless/fleet deployment is no longer
+   supported.
 4. **A second window or a sheet for Now Streaming?** Spotish uses a full-screen
    sheet. teehee is small enough that the Stream page is the full view; no
    second window. Recommendation: sheet only for the first-run trust and

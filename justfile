@@ -32,44 +32,14 @@ clippy:
 check:
     cargo check --workspace
 
-# Alert on sender trouble (ring fill, drift saturation, dead sender).
-# Interactive foreground watcher; the TeeHeeWatch scheduled task runs
-# the same script in -Check mode every 5 min.
-watch-send:
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/send_watch.ps1
-
-# Watch the watcher: alert when the TeeHeeWatch heartbeat goes stale
-# (scheduled task disabled/broken). The TeeHeeWatchdog scheduled task
-# runs this every 10 min.
-watchdog:
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/send_watchdog.ps1
-
-# Register the TeeHeeWatch scheduled task (every 5 min, current user,
-# elevated). Runs the VBS launcher so no console window flashes.
-# Run from an elevated prompt once per machine.
-install-watch:
-    schtasks /Create /F /TN TeeHeeWatch /SC MINUTE /MO 5 /TR "wscript.exe \"{{justfile_directory()}}\scripts\send_watch_task.vbs\"" /RL HIGHEST
-
-# Register the TeeHeeWatchdog scheduled task (every 10 min, current user,
-# elevated). Alerts if the TeeHeeWatch heartbeat goes stale.
-# Run from an elevated prompt once per machine.
-install-watchdog:
-    schtasks /Create /F /TN TeeHeeWatchdog /SC MINUTE /MO 10 /TR "wscript.exe \"{{justfile_directory()}}\scripts\send_watchdog_task.vbs\"" /RL HIGHEST
-
-# Rotate oversized logs into logs/archive and prune old archives.
+# Rotate oversized legacy logs into logs/archive and prune old archives.
+# The GUI rotates its own session log; this is for old CLI/task logs.
 rotate-logs:
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rotate_logs.ps1
 
-# Register the TeeHeeRotate scheduled task (daily, current user,
-# elevated). Rotates oversized logs and prunes old archives.
-# Run from an elevated prompt once per machine.
-install-rotate:
-    schtasks /Create /F /TN TeeHeeRotate /SC DAILY /MO 1 /TR "wscript.exe \"{{justfile_directory()}}\scripts\rotate_logs_task.vbs\"" /RL HIGHEST
-
-# Run the sender in the foreground (same args as the TeeHeeSender
-# scheduled task, which runs teehee.exe directly — no supervisor).
-# For manual runs / debugging; the task self-heals via its 2-min
-# periodic trigger + the sender's single-instance mutex guard.
+# Run the CLI sender in the foreground for manual debugging. The GUI in
+# gui/ is the supported sender; this path does not start at login or
+# reconnect after an error.
 sender:
     ./target/release/teehee.exe send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file logs/send.jsonl --capture-buffer-ms 1200
 

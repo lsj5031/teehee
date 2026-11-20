@@ -1,6 +1,11 @@
 import { computed, Text, View, Scroll } from "nsh";
 import {
   captureBufferMs,
+  captureCallbacks,
+  captureLatencyDrops,
+  captureNonzero,
+  captureOverruns,
+  captureUnderruns,
   driftAvailable,
   driftPpm,
   events,
@@ -22,6 +27,8 @@ import {
   role,
   rxBufferMs,
   sendErrors,
+  sessionLogPath,
+  source,
 } from "../state/session";
 import { Button } from "../ui/controls";
 import { Icon } from "../ui/icon";
@@ -39,6 +46,15 @@ const checks = computed(() => {
             title: "Receiver is accepting packets",
             detail: `${sendErrors()} send errors`,
           },
+          ...(source() === "system"
+            ? [
+                {
+                  ok: captureCallbacks() > 0,
+                  title: "Loopback is delivering callbacks",
+                  detail: `${captureCallbacks()} callbacks · ${captureNonzero()} non-silent samples`,
+                },
+              ]
+            : []),
         ]
       : []),
     {
@@ -159,6 +175,11 @@ function SenderDiagnostics() {
                 value={`${ringMs()} ms`}
                 detail={`of ${captureBufferMs()} ms`}
               />
+              <Counter
+                label="Capture"
+                value={`${captureCallbacks()}`}
+                detail={`callbacks · ${captureNonzero()} non-silent`}
+              />
             </View>
             <View class="flex-1">
               <Counter
@@ -183,6 +204,11 @@ function SenderDiagnostics() {
                 value={`${Math.max(0, captureBufferMs() - ringMs())} ms`}
                 detail="before capture drops"
               />
+              <Counter
+                label="Capture drops"
+                value={`${captureOverruns()}`}
+                detail={`${captureLatencyDrops()} latency · ${captureUnderruns()} underruns`}
+              />
             </View>
           </View>
         </Card>
@@ -195,6 +221,17 @@ function SenderDiagnostics() {
             </Text>
           </View>
           <Sparkline values={history()} max={Math.max(120, captureBufferMs())} height={52} />
+        </Card>
+
+        <Card class="flex-col gap-1 p-4">
+          <SectionLabel label="Session log" />
+          <Text class="font-mono text-[11px] text-foreground">
+            {sessionLogPath() || "No session log — the log folder is not writable."}
+          </Text>
+          <Text class="text-[10px] text-muted-foreground">
+            One JSON object per second: packets, ring depth, drift and capture
+            counters.
+          </Text>
         </Card>
 
         <EventsCard />

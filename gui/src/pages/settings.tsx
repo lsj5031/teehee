@@ -1,4 +1,17 @@
 import { Text, View, Scroll } from "nsh";
+import {
+  alertsEnabled,
+  launchAtLogin,
+  launchAtLoginError,
+  reconnect,
+  sessionLogPath,
+  setAlerts,
+  setOpenAtLogin,
+  setReconnect,
+  setStartOnOpen,
+  startOnOpen,
+} from "../state/session";
+import { SwitchRow } from "../ui/controls";
 import { Card, SectionLabel } from "../ui/surfaces";
 import { PageHeader } from "../components/page-header";
 
@@ -11,14 +24,59 @@ export function SettingsPage() {
       />
 
       <Scroll scrollbar={true} class="flex-1" contentClass="flex-col gap-5 px-7 pb-24">
+        <Card class="flex-col gap-1 p-4">
+          <SectionLabel label="Behavior" />
+          <SwitchRow
+            label="Open at login"
+            description="Start teehee when you sign in, in this session where loopback capture works."
+            checked={launchAtLogin()}
+            onChange={(checked) => {
+              void setOpenAtLogin(checked);
+            }}
+          />
+          <SwitchRow
+            label="Start streaming when teehee opens"
+            description="Begin sending to the saved receiver without pressing Start."
+            checked={startOnOpen()}
+            onChange={setStartOnOpen}
+          />
+          <SwitchRow
+            label="Reconnect automatically"
+            description="Restart the sender after an error, with backoff."
+            checked={reconnect()}
+            onChange={setReconnect}
+          />
+          <SwitchRow
+            label="Desktop alerts"
+            description="Notify when the sender stops or capture needs attention."
+            checked={alertsEnabled()}
+            onChange={setAlerts}
+          />
+          <If when={launchAtLoginError() !== ""}>
+            <Text class="text-[11px] text-destructive">
+              {launchAtLoginError()}
+            </Text>
+          </If>
+        </Card>
+
         <Card class="flex-col gap-2 p-4">
-          <SectionLabel label="This build" />
-          <Text class="text-[13px] text-foreground">
-            Startup, tray, and reconnection controls are not available yet.
+          <SectionLabel label="Session log" />
+          <Text class="font-mono text-[11px] text-foreground">
+            {sessionLogPath() || "No session log — the log folder is not writable."}
           </Text>
           <Text class="text-[11px] text-muted-foreground">
-            teehee starts and stops streams manually. This build does not write
-            a session log, expose a control port, or follow the Windows volume.
+            One JSON object per second: packets, ring depth, drift and capture
+            counters. The GUI keeps this history itself; no scheduled task is
+            involved.
+          </Text>
+        </Card>
+
+        <Card class="flex-col gap-2 p-4">
+          <SectionLabel label="This build" />
+          <Text class="text-[11px] text-muted-foreground">
+            The local control port, follow-system-volume and the tray menu are
+            not exposed here yet. Audio is unencrypted, so use teehee only on a
+            network you trust.
           </Text>
         </Card>
 

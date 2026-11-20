@@ -111,8 +111,8 @@ export function SwitchRow(props: {
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <View class="flex-row items-center justify-between gap-4 py-2.5">
-      <View class="flex-col gap-0.5 flex-1">
+    <View class="w-full flex-row items-center justify-between gap-4 py-2.5">
+      <View class="flex-1 min-w-0 flex-col gap-0.5">
         <Text class="text-[13px] text-foreground">{props.label}</Text>
         <If when={props.description}>
           <Text class="text-[11px] text-muted-foreground">
@@ -123,7 +123,9 @@ export function SwitchRow(props: {
       <Switch
         checked={props.checked}
         onChange={(event) => props.onChange(event.checked)}
-        trackClass="h-5 w-9 rounded-full bg-muted transition-colors ease-ui checked:bg-primary"
+        accessibilityLabel={props.label}
+        class="ml-auto w-9 shrink-0 grow-0"
+        trackClass="h-5 w-9 p-0.5 rounded-full bg-muted transition-colors ease-ui checked:bg-primary"
         thumbClass="h-4 w-4 rounded-full bg-card shadow-sm transition-transform ease-ui checked:translate-x-4"
       />
     </View>

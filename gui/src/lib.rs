@@ -7,6 +7,8 @@
 //! NSH engine types to TypeScript.
 
 use std::io::ErrorKind;
+#[cfg(not(test))]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -16,14 +18,17 @@ use nsh_core::prelude::*;
 use serde_json::json;
 use teehee::audio_io::{AudioCapture, Capturer, Player, PlayerConfig};
 use teehee::buffer_budget::compute_capacity_packets;
-use teehee::capture_ring::CaptureRing;
+use teehee::capture_ring::{CaptureRing, CaptureRingStats};
+use teehee::clock_drift::{ClockDriftTracker, Ema, period_for_ppm};
 use teehee::discovery::{self, DiscoveredReceiver};
 use teehee::format_pipeline::FormatPipeline;
 use teehee::generated::SineSource;
 use teehee::jitter::JitterBuffer;
+use teehee::jsonl_log::{JsonVal, JsonlLogger};
 use teehee::mtu_budget::{compute_budget, exceeds_budget, validate_mtu};
 use teehee::network::{Receiver, Sender};
-use teehee::protocol::{Packet, HEADER_LEN, MAX_PAYLOAD_LEN};
+use teehee::protocol::{HEADER_LEN, MAX_PAYLOAD_LEN, Packet};
+use teehee::single_instance::{SEND_MUTEX_NAME, SingleInstanceGuard};
 
 #[native_module("teehee/native")]
 fn native(registry: &mut Registry) {
@@ -38,6 +43,14 @@ struct SendTelemetry {
     packets_per_sec: f64,
     peak: f32,
     ring_ms: u64,
+    capture_callbacks: u64,
+    capture_pushed_samples: u64,
+    capture_nonzero_samples: u64,
+    capture_overruns: u64,
+    capture_underruns: u64,
+    capture_latency_drops: u64,
+    capture_high_water_ms: u64,
+    capture_ring_samples: usize,
     drift_ppm: Option<f32>,
     fragmentations: u64,
     send_errors: u64,
@@ -57,6 +70,14 @@ impl Default for SendTelemetry {
             packets_per_sec: 0.0,
             peak: 0.0,
             ring_ms: 0,
+            capture_callbacks: 0,
+            capture_pushed_samples: 0,
+            capture_nonzero_samples: 0,
+            capture_overruns: 0,
+            capture_underruns: 0,
+            capture_latency_drops: 0,
+            capture_high_water_ms: 0,
+            capture_ring_samples: 0,
             drift_ppm: None,
             fragmentations: 0,
             send_errors: 0,
@@ -126,6 +147,8 @@ struct EngineInner {
     send: Mutex<SendTelemetry>,
     recv: Mutex<RecvTelemetry>,
     receivers: Mutex<ReceiverState>,
+    log: Arc<JsonlLogger>,
+    log_path: Option<String>,
     send_stop: AtomicBool,
     send_pause: AtomicBool,
     recv_stop: AtomicBool,
@@ -133,11 +156,21 @@ struct EngineInner {
 }
 
 impl EngineInner {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_log(
+            Arc::new(JsonlLogger::open(None).expect("a disabled JSONL logger cannot fail to open")),
+            None,
+        )
+    }
+
+    fn with_log(log: Arc<JsonlLogger>, log_path: Option<String>) -> Self {
         Self {
             send: Mutex::new(SendTelemetry::default()),
             recv: Mutex::new(RecvTelemetry::default()),
             receivers: Mutex::new(ReceiverState::default()),
+            log,
+            log_path,
             send_stop: AtomicBool::new(false),
             send_pause: AtomicBool::new(false),
             recv_stop: AtomicBool::new(false),
@@ -146,11 +179,15 @@ impl EngineInner {
     }
 
     fn send(&self) -> MutexGuard<'_, SendTelemetry> {
-        self.send.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.send
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn recv(&self) -> MutexGuard<'_, RecvTelemetry> {
-        self.recv.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.recv
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn receivers(&self) -> MutexGuard<'_, ReceiverState> {
@@ -162,6 +199,8 @@ impl EngineInner {
     fn set_send_error(&self, error: String) {
         let mut state = self.send();
         if state.phase != "idle" {
+            self.log
+                .emit("send_error", &[("error", JsonVal::from(error.as_str()))]);
             state.phase = "error".into();
             state.error = Some(error);
             state.packets_per_sec = 0.0;
@@ -189,12 +228,19 @@ pub struct Engine {
     discovery_thread: Option<JoinHandle<()>>,
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[class]
 impl Engine {
     /// A stopped engine with no sessions.
     pub fn new() -> Self {
+        let (log, log_path) = open_session_log();
         Self {
-            inner: Arc::new(EngineInner::new()),
+            inner: Arc::new(EngineInner::with_log(log, log_path)),
             send_thread: None,
             recv_thread: None,
             discovery_thread: None,
@@ -225,6 +271,11 @@ impl Engine {
         }
 
         self.stop_send()?;
+        // Hold the same named mutex the CLI uses for the lifetime of this
+        // session, so a scheduled/manual `teehee send` and the GUI can
+        // never double-stream to the same receiver.
+        let guard =
+            SingleInstanceGuard::acquire(SEND_MUTEX_NAME).map_err(|error| error.to_string())?;
         self.inner.send_stop.store(false, Ordering::SeqCst);
         self.inner.send_pause.store(false, Ordering::SeqCst);
         {
@@ -240,9 +291,20 @@ impl Engine {
                 ..SendTelemetry::default()
             };
         }
+        self.inner.log.emit(
+            "send_start",
+            &[
+                ("target", JsonVal::from(target.as_str())),
+                ("source", JsonVal::from(source.as_str())),
+                ("chunk_ms", JsonVal::from(chunk_ms)),
+                ("mtu_bytes", JsonVal::from(mtu)),
+                ("capture_buffer_ms", JsonVal::from(capture_buffer_ms)),
+            ],
+        );
 
         let inner = Arc::clone(&self.inner);
         self.send_thread = Some(thread::spawn(move || {
+            let _guard = guard;
             if let Err(error) = send_worker(
                 Arc::clone(&inner),
                 target,
@@ -259,6 +321,10 @@ impl Engine {
 
     /// Stop the sender and wait for its capture and network resources.
     pub fn stop_send(&mut self) -> Result<(), String> {
+        let (was_active, packets_sent) = {
+            let state = self.inner.send();
+            (state.phase != "idle", state.packets_sent)
+        };
         self.inner.send_stop.store(true, Ordering::SeqCst);
         self.inner.send_pause.store(false, Ordering::SeqCst);
         if let Some(handle) = self.send_thread.take() {
@@ -271,9 +337,25 @@ impl Engine {
         state.packets_per_sec = 0.0;
         state.peak = 0.0;
         state.ring_ms = 0;
+        state.capture_callbacks = 0;
+        state.capture_pushed_samples = 0;
+        state.capture_nonzero_samples = 0;
+        state.capture_overruns = 0;
+        state.capture_underruns = 0;
+        state.capture_latency_drops = 0;
+        state.capture_high_water_ms = 0;
+        state.capture_ring_samples = 0;
+        state.drift_ppm = None;
         state.elapsed_ms = 0;
         state.fragmentations = 0;
         state.send_errors = 0;
+        drop(state);
+        if was_active {
+            self.inner.log.emit(
+                "send_stop",
+                &[("packets_sent", JsonVal::from(packets_sent))],
+            );
+        }
         Ok(())
     }
 
@@ -281,19 +363,30 @@ impl Engine {
     /// ring is cleared while paused so resuming never replays stale audio.
     pub fn set_send_paused(&mut self, paused: bool) {
         self.inner.send_pause.store(paused, Ordering::SeqCst);
-        let mut state = self.inner.send();
-        if paused {
-            if state.phase == "live" || state.phase == "starting" {
-                state.phase = "paused".into();
-                state.packets_per_sec = 0.0;
-                state.peak = 0.0;
-            }
-        } else if state.phase == "paused" {
-            state.phase = if state.packets_sent > 0 {
-                "live".into()
+        let transitioned = {
+            let mut state = self.inner.send();
+            if paused {
+                if state.phase == "live" || state.phase == "starting" {
+                    state.phase = "paused".into();
+                    state.packets_per_sec = 0.0;
+                    state.peak = 0.0;
+                    Some("send_pause")
+                } else {
+                    None
+                }
+            } else if state.phase == "paused" {
+                state.phase = if state.packets_sent > 0 {
+                    "live".into()
+                } else {
+                    "starting".into()
+                };
+                Some("send_resume")
             } else {
-                "starting".into()
-            };
+                None
+            }
+        };
+        if let Some(event) = transitioned {
+            self.inner.log.emit(event, &[]);
         }
     }
 
@@ -411,6 +504,7 @@ impl Engine {
         let recv = self.inner.recv().clone();
         let receivers = self.inner.receivers().clone();
         json!({
+            "log_path": self.inner.log_path.as_deref(),
             "send": {
                 "phase": send.phase,
                 "error": send.error,
@@ -418,6 +512,14 @@ impl Engine {
                 "packets_per_sec": send.packets_per_sec,
                 "peak": send.peak,
                 "ring_ms": send.ring_ms,
+                "capture_callbacks": send.capture_callbacks,
+                "capture_pushed_samples": send.capture_pushed_samples,
+                "capture_nonzero_samples": send.capture_nonzero_samples,
+                "capture_overruns": send.capture_overruns,
+                "capture_underruns": send.capture_underruns,
+                "capture_latency_drops": send.capture_latency_drops,
+                "capture_high_water_ms": send.capture_high_water_ms,
+                "capture_ring_samples": send.capture_ring_samples,
                 "drift_ppm": send.drift_ppm,
                 "fragmentations": send.fragmentations,
                 "send_errors": send.send_errors,
@@ -482,32 +584,109 @@ fn receiver_item(found: DiscoveredReceiver) -> ReceiverItem {
 }
 
 fn push_capture(ring: &Arc<Mutex<Option<CaptureRing>>>, data: &[f32]) {
-    if let Ok(mut guard) = ring.lock() {
-        if let Some(capture) = guard.as_mut() {
-            capture.push(data);
-        }
+    if let Ok(mut guard) = ring.lock()
+        && let Some(capture) = guard.as_mut()
+    {
+        capture.push(data);
     }
 }
 
-fn pop_capture(ring: &Arc<Mutex<Option<CaptureRing>>>, samples: usize) -> Option<Vec<f32>> {
-    ring.lock()
-        .ok()
-        .and_then(|mut guard| guard.as_mut().and_then(|capture| capture.pop_chunk(samples)))
+fn pop_capture(
+    ring: &Arc<Mutex<Option<CaptureRing>>>,
+    samples: usize,
+) -> (Option<Vec<f32>>, usize) {
+    match ring.lock() {
+        Ok(mut guard) => match guard.as_mut() {
+            Some(capture) => {
+                let chunk = capture.pop_chunk(samples);
+                (chunk, capture.len())
+            }
+            None => (None, 0),
+        },
+        Err(_) => (None, 0),
+    }
 }
 
-fn ring_depth_ms(ring: &Arc<Mutex<Option<CaptureRing>>>, sample_rate: u32, channels: u8) -> u64 {
-    let divisor = sample_rate as u64 * channels as u64;
-    if divisor == 0 {
-        return 0;
-    }
+fn capture_stats(ring: &Arc<Mutex<Option<CaptureRing>>>) -> Option<CaptureRingStats> {
     ring.lock()
         .ok()
-        .and_then(|guard| {
-            guard.as_ref().map(|capture| {
-                capture.len() as u64 * 1_000 / divisor
-            })
-        })
-        .unwrap_or(0)
+        .and_then(|guard| guard.as_ref().map(|capture| capture.stats()))
+}
+
+fn disabled_logger() -> Arc<JsonlLogger> {
+    Arc::new(JsonlLogger::open(None).expect("a disabled JSONL logger cannot fail to open"))
+}
+
+#[cfg(test)]
+fn open_session_log() -> (Arc<JsonlLogger>, Option<String>) {
+    (disabled_logger(), None)
+}
+
+/// Open the GUI's durable session history. A failure to create it must
+/// not stop audio, so a missing path simply disables the log and leaves
+/// `log_path` null in the status snapshot.
+#[cfg(not(test))]
+fn open_session_log() -> (Arc<JsonlLogger>, Option<String>) {
+    let Some(path) = session_log_path() else {
+        return (disabled_logger(), None);
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    rotate_session_log(&path);
+    match JsonlLogger::open(Some(&path)) {
+        Ok(log) => (Arc::new(log), Some(path.display().to_string())),
+        Err(_) => (disabled_logger(), None),
+    }
+}
+
+#[cfg(not(test))]
+const SESSION_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Keep one previous generation. The GUI is the only writer, so a
+/// size check at open avoids the CLI's external rotation task.
+#[cfg(not(test))]
+fn rotate_session_log(path: &Path) {
+    let oversized = std::fs::metadata(path)
+        .map(|metadata| metadata.len() > SESSION_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    if !oversized {
+        return;
+    }
+    let rotated = path.with_file_name("send.jsonl.1");
+    let _ = std::fs::remove_file(&rotated);
+    let _ = std::fs::rename(path, &rotated);
+}
+
+#[cfg(all(not(test), target_os = "windows"))]
+fn session_log_path() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|base| {
+        PathBuf::from(base)
+            .join("teehee")
+            .join("logs")
+            .join("send.jsonl")
+    })
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn session_log_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Logs")
+            .join("teehee")
+            .join("send.jsonl")
+    })
+}
+
+#[cfg(all(not(test), not(target_os = "windows"), not(target_os = "macos")))]
+fn session_log_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })?;
+    Some(base.join("teehee").join("logs").join("send.jsonl"))
 }
 
 #[cfg(target_os = "windows")]
@@ -560,7 +739,8 @@ fn validate_send_chunk(
     let chunk_frames = (u128::from(sample_rate) * chunk_ms as u128 / 1000).max(1);
     let chunk_samples = chunk_frames * u128::from(channels);
     let payload_bytes = chunk_samples * std::mem::size_of::<f32>() as u128;
-    let chunk_description = || format!("{chunk_ms} ms at {sample_rate} Hz with {channels} channels");
+    let chunk_description =
+        || format!("{chunk_ms} ms at {sample_rate} Hz with {channels} channels");
     let remedy = "Reduce the chunk duration or choose a lower sample rate or channel count.";
     if payload_bytes > MAX_PAYLOAD_LEN as u128 {
         return Err(format!(
@@ -632,7 +812,8 @@ fn send_worker(
         let config = capture.config();
         (config.sample_rate, config.channels)
     });
-    let (channels, chunk_frames, chunk_samples) = validate_send_chunk(sample_rate, channels, chunk_ms)?;
+    let (channels, chunk_frames, chunk_samples) =
+        validate_send_chunk(sample_rate, channels, chunk_ms)?;
     let budget = compute_budget(mtu, channels).map_err(|error| error.to_string())?;
 
     if capturer.is_some() {
@@ -645,9 +826,23 @@ fn send_worker(
     }
 
     let mut chunk = vec![0.0_f32; chunk_samples];
-    let period = Duration::from_nanos(
-        ((chunk_frames as u64 * 1_000_000_000) / sample_rate as u64).max(1),
-    );
+    let base_period =
+        Duration::from_nanos(((chunk_frames as u64 * 1_000_000_000) / sample_rate as u64).max(1));
+    // Sender-side drift compensation: the capture clock is not the wall
+    // clock, so a fixed pacing period lets the ring drift until it clips
+    // (delay grows) or starves (silence chunks). Track the post-pop ring
+    // depth and nudge the period by the measured ppm, exactly as the CLI
+    // does. The settle delay keeps the initial 0 → target fill ramp out of
+    // the regression.
+    let target_ms = (chunk_ms * 2).max(15);
+    let target_samples = target_ms * sample_rate as usize * channels as usize / 1000;
+    let mut drift = ClockDriftTracker::with_window(sample_rate, target_samples, channels, 30.0);
+    let mut ema_depth = Ema::new(0.01);
+    let mut drift_started_at = Instant::now();
+    let mut drift_ppm: Option<f32> = None;
+    let mut period = base_period;
+    let stall_threshold = Duration::from_millis((chunk_ms.saturating_mul(4).max(20)) as u64);
+    let mut last_iteration = Instant::now();
 
     {
         let mut state = inner.send();
@@ -662,6 +857,7 @@ fn send_worker(
     let started = Instant::now();
     let mut next_tick = Instant::now();
     let mut last_report = Instant::now();
+    let mut last_log = Instant::now();
     let mut last_packets = 0_u64;
     let mut packets = 0_u64;
     let mut errors = 0_u64;
@@ -670,11 +866,24 @@ fn send_worker(
     let mut peak;
 
     while !inner.send_stop.load(Ordering::SeqCst) {
+        let iteration_started = Instant::now();
+        let stalled = iteration_started.duration_since(last_iteration) > stall_threshold;
+        last_iteration = iteration_started;
+        if stalled {
+            // The ring collected audio while the loop was preempted;
+            // start a fresh pacing epoch and let drift re-learn the fill.
+            next_tick = iteration_started;
+            drift.reset();
+            ema_depth.reset();
+            drift_started_at = iteration_started;
+            drift_ppm = None;
+            period = base_period;
+        }
         if inner.send_pause.load(Ordering::SeqCst) {
-            if let Ok(mut guard) = ring.lock() {
-                if let Some(capture) = guard.as_mut() {
-                    capture.clear();
-                }
+            if let Ok(mut guard) = ring.lock()
+                && let Some(capture) = guard.as_mut()
+            {
+                capture.clear();
             }
             {
                 let mut state = inner.send();
@@ -684,23 +893,41 @@ fn send_worker(
                     state.peak = 0.0;
                 }
             }
+            drift.reset();
+            ema_depth.reset();
+            drift_started_at = Instant::now();
+            drift_ppm = None;
+            period = base_period;
             thread::sleep(Duration::from_millis(20));
             next_tick = Instant::now();
             continue;
         }
 
-        if let Some(source) = sine.as_mut() {
-            source.fill_chunk(&mut chunk);
+        let (captured, post_pop_depth) = if let Some(sine) = sine.as_mut() {
+            sine.fill_chunk(&mut chunk);
+            (None, 0)
         } else {
-            match pop_capture(&ring, chunk_samples) {
-                Some(captured) => chunk = captured,
-                None => chunk.fill(0.0),
-            }
+            pop_capture(&ring, chunk_samples)
+        };
+        if let Some(captured) = captured {
+            chunk = captured;
+        } else if sine.is_none() {
+            chunk.fill(0.0);
         }
 
-        peak = chunk.iter().fold(0.0_f32, |current, sample| {
-            current.max(sample.abs())
-        });
+        // Measure the ring after the pop (the same instant the CLI feeds
+        // its regression) once the startup fill has settled. Generated
+        // tones have no capture clock, so their drift stays unmeasured.
+        if capturer.is_some() && drift_started_at.elapsed() >= Duration::from_secs(5) {
+            drift.update(ema_depth.update(post_pop_depth as f64) as usize);
+            let ppm = drift.current_ppm();
+            drift_ppm = Some(ppm);
+            period = period_for_ppm(base_period, ppm);
+        }
+
+        peak = chunk
+            .iter()
+            .fold(0.0_f32, |current, sample| current.max(sample.abs()));
         let packet = Packet::new(
             sequence,
             sequence as u64 * chunk_frames as u64,
@@ -724,7 +951,9 @@ fn send_worker(
             Err(error)
                 if matches!(
                     error.kind(),
-                    ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::WouldBlock
                 ) =>
             {
                 errors = errors.saturating_add(1);
@@ -736,20 +965,75 @@ fn send_worker(
         if last_report.elapsed() >= Duration::from_millis(200) {
             let elapsed = last_report.elapsed().as_secs_f64().max(0.001);
             let rate = (packets.saturating_sub(last_packets)) as f64 / elapsed;
-            let depth = ring_depth_ms(&ring, sample_rate, channels);
+            let stats = capture_stats(&ring).unwrap_or_default();
             {
                 let mut state = inner.send();
                 state.packets_sent = packets;
                 state.packets_per_sec = rate;
                 state.peak = peak;
-                state.ring_ms = depth;
+                state.ring_ms = stats.depth_ms;
+                state.capture_callbacks = stats.callbacks;
+                state.capture_pushed_samples = stats.pushed_samples;
+                state.capture_nonzero_samples = stats.nonzero_samples;
+                state.capture_overruns = stats.overruns;
+                state.capture_underruns = stats.underruns;
+                state.capture_latency_drops = stats.latency_drops;
+                state.capture_high_water_ms = stats.high_water_ms;
+                state.capture_ring_samples = stats.samples;
                 state.fragmentations = fragmentations;
                 state.send_errors = errors;
                 state.elapsed_ms = started.elapsed().as_millis() as u64;
-                state.drift_ppm = None;
+                state.drift_ppm = drift_ppm;
             }
             last_report = Instant::now();
             last_packets = packets;
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(1) {
+            let stats = capture_stats(&ring).unwrap_or_default();
+            let (rate, paused) = {
+                let state = inner.send();
+                (
+                    state.packets_per_sec,
+                    inner.send_pause.load(Ordering::SeqCst),
+                )
+            };
+            inner.log.emit(
+                "send_stats",
+                &[
+                    ("packets_sent", JsonVal::from(packets)),
+                    ("packets_per_sec", JsonVal::from(rate)),
+                    ("mtu_bytes", JsonVal::from(mtu)),
+                    ("fragmentations", JsonVal::from(fragmentations)),
+                    ("send_errors", JsonVal::from(errors)),
+                    ("capture_ring_ms", JsonVal::from(stats.depth_ms)),
+                    (
+                        "capture_ring_high_water_ms",
+                        JsonVal::from(stats.high_water_ms),
+                    ),
+                    ("capture_overruns", JsonVal::from(stats.overruns)),
+                    ("capture_underruns", JsonVal::from(stats.underruns)),
+                    ("capture_latency_drops", JsonVal::from(stats.latency_drops)),
+                    ("capture_callbacks", JsonVal::from(stats.callbacks)),
+                    (
+                        "capture_pushed_samples",
+                        JsonVal::from(stats.pushed_samples),
+                    ),
+                    (
+                        "capture_nonzero_samples",
+                        JsonVal::from(stats.nonzero_samples),
+                    ),
+                    ("capture_ring_samples", JsonVal::from(stats.samples)),
+                    (
+                        "send_drift_ppm",
+                        JsonVal::from(drift_ppm.unwrap_or(0.0) as f64),
+                    ),
+                    ("chunk_ms", JsonVal::from(chunk_ms)),
+                    ("source", JsonVal::from(source_label.as_str())),
+                    ("paused", JsonVal::from(paused)),
+                ],
+            );
+            last_log = Instant::now();
         }
 
         next_tick += period;
@@ -840,8 +1124,8 @@ fn recv_worker(
     prebuffer_ms: usize,
     rx_buffer_ms: usize,
 ) -> Result<(), String> {
-    let socket = Receiver::bind(("0.0.0.0", port))
-        .map_err(|error| format!("bind UDP {port}: {error}"))?;
+    let socket =
+        Receiver::bind(("0.0.0.0", port)).map_err(|error| format!("bind UDP {port}: {error}"))?;
     let _advertiser = discovery::Advertiser::advertise(port, "teehee-gui", "teehee.local.").ok();
     let output_config: Arc<OnceLock<PlayerConfig>> = Arc::new(OnceLock::new());
     let state: Arc<Mutex<Option<RxState>>> = Arc::new(Mutex::new(None));
@@ -882,7 +1166,7 @@ fn recv_worker(
                 let needed_frames = out_frames - written;
                 let input_frames = ((needed_frames as u64 * rx.input_rate as u64)
                     .div_ceil(config.sample_rate as u64))
-                    .max(1) as usize;
+                .max(1) as usize;
                 let input_samples = input_frames * rx.input_channels as usize;
                 if rx.scratch.len() < input_samples {
                     rx.scratch.resize(input_samples, 0.0);
@@ -960,9 +1244,7 @@ fn receive_packets(
                     let samples_per_ms = packet.sample_rate as usize * packet.channels as usize;
                     let prebuffer_frames = prebuffer_ms * samples_per_ms / 1000;
                     let capacity_frames = rx_buffer_ms * samples_per_ms / 1000;
-                    let high_water = (prebuffer_ms + 100)
-                        .saturating_mul(samples_per_ms)
-                        / 1000;
+                    let high_water = (prebuffer_ms + 100).saturating_mul(samples_per_ms) / 1000;
                     *guard = Some(RxState {
                         jb: JitterBuffer::with_high_water(
                             samples.len(),
@@ -986,11 +1268,13 @@ fn receive_packets(
                     recv.channels = packet.channels as u32;
                 }
 
-                peak = samples.iter().fold(peak, |current, sample| current.max(sample.abs()));
-                if let Some(rx) = guard.as_mut() {
-                    if samples.len() == rx.samples_per_packet {
-                        let _ = rx.jb.push(packet.sequence, &samples);
-                    }
+                peak = samples
+                    .iter()
+                    .fold(peak, |current, sample| current.max(sample.abs()));
+                if let Some(rx) = guard.as_mut()
+                    && samples.len() == rx.samples_per_packet
+                {
+                    let _ = rx.jb.push(packet.sequence, &samples);
                 }
                 packets = packets.saturating_add(1);
                 if packets == 1 {
@@ -1002,7 +1286,9 @@ fn receive_packets(
             Err(error)
                 if matches!(
                     error.kind(),
-                    ErrorKind::ConnectionReset | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionRefused
+                        | ErrorKind::WouldBlock
                 ) => {}
             Err(error) => return Err(format!("receive: {error}")),
         }
@@ -1020,7 +1306,11 @@ fn receive_packets(
             let mut recv = inner.recv();
             recv.packets_received = packets;
             recv.packets_per_sec = (packets - last_packets) as f64 / interval.as_secs_f64();
-            recv.peak = if inner.recv_pause.load(Ordering::Relaxed) { 0.0 } else { peak };
+            recv.peak = if inner.recv_pause.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                peak
+            };
             recv.queued_ms = queued_ms;
             recv.late_drops = stats.late_drops;
             recv.underruns = stats.underrun_resyncs;

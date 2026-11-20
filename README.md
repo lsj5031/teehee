@@ -60,17 +60,17 @@ with `--mdns` on the sender.
 That is the entire setup. For every flag, the wire format, and the tuning
 recipes, see the [detailed reference](docs/reference.md).
 
-## Desktop GUI (preview)
+## Desktop GUI
 
 A native desktop app built with [NSH](https://nsh.dev/) lives in [`gui/`](gui/).
 It wraps the same concepts in a calmer interface: a quiet sidebar, a floating
 stream bar, plain-language health checks, and explicit source choices (system
 audio / microphone / test tone) — no silent `auto` mode.
 
-> **Status:** the UI currently runs on a mock session (`gui/src/state/session.ts`)
-> that simulates a sender and receiver so the screens and state transitions can
-> be developed without hardware. It is a design prototype, not yet a controller
-> for the CLI engine. See the [GUI README](gui/README.md) and the
+> **Status:** the app now runs the native engine (not the mock session). It is
+> the supported sender: it starts at login, reconnects after errors, writes a
+> JSONL session log, and compensates clock drift itself. The Task Scheduler
+> recipe is retired. See the [GUI README](gui/README.md) and the
 > [design specification](docs/gui-design.md).
 
 <table>
@@ -115,8 +115,8 @@ nsh run App.tsx
 
 Each GitHub release also carries native GUI bundles built by CI: a macOS
 `.app` (arm64 and Intel), a Linux `.tar.gz`, and a portable Windows `.zip`.
-They carry the same mock session as the source build, so treat them as
-previews of the interface rather than a replacement for the CLI.
+They carry the same native sender as the source build, so the Windows zip
+can replace the CLI for interactive use.
 
 ## How it works
 
@@ -157,16 +157,12 @@ JSONL field names, low-latency recipe, clock-drift math, and troubleshooting.
 
 ## Operating it on Windows
 
-For an always-on sender, run `teehee.exe` directly from a Task Scheduler task:
-the at-logon trigger puts it in the interactive session where WASAPI loopback
-actually captures audio, and a repeating trigger plus a named single-instance
-mutex provide self-healing without a supervisor. `scripts/send_watch.ps1` reads
-the JSONL stats and alerts on drift, ring fill, or a dead sender; a watchdog
-watches the watcher. All of it is installed with `just install-watch`,
-`just install-watchdog`, and `just install-rotate`.
-
-Full XML, thresholds, and verification commands are in the
-[detailed reference](docs/reference.md#windows-deployment-scheduled-task).
+The GUI is the supported sender; see [Desktop GUI](#desktop-gui) above. It
+starts at login, reconnects after errors, writes a JSONL session log, and takes
+the `Local\TeeHeeSend` mutex so it cannot double-stream with a CLI sender. The
+old Task Scheduler recipe is retired; the deployment notes in the
+[detailed reference](docs/reference.md#windows-deployment-gui-only) describe
+the migration.
 
 ## Security
 
@@ -180,7 +176,7 @@ trusted LAN, and never expose the receiver port to the public internet.
 cargo build --release   # CLI binary
 cargo test              # full Rust suite
 cargo clippy --all-targets -- -D warnings
-cd gui && nsh run App.tsx   # GUI prototype
+cd gui && nsh run App.tsx   # desktop app (supported sender)
 ```
 
 `just` recipes wrap the common commands (`just ci`, `just build`, `just test`,

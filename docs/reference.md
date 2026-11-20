@@ -461,263 +461,28 @@ receiver on a single machine, or to run the localhost smoke test:
 You should see the sender log ~50 packets/sec and the receiver log
 `late_drops=0 duplicates=0 silence_insertions=0` every second.
 
-## Windows deployment (scheduled task)
+## Windows deployment (GUI only)
 
-For a persistent sender that survives reboots and self-heals after a
-crash, run `teehee.exe` **directly** from a Task Scheduler task — no
-bash supervisor, no pid files, no third-party service wrapper. This is
-the supported way to deploy the sender on Windows.
+teehee is an interactive desktop app. The supported sender is the GUI in
+`gui/`; there is no supported Task Scheduler, service or headless sender. The
+old `TeeHeeSender` / `TeeHeeWatch` / `TeeHeeWatchdog` / `TeeHeeRotate` recipe is
+retired - disable or delete those tasks, then use the app.
 
-Why not a Windows service? WASAPI loopback capture is *session-bound*:
-it captures the audio rendered in the interactive logon session. A
-service runs in session 0, so it would start cleanly but capture
-silence. Task Scheduler's at-logon trigger runs the task in your
-session — exactly where loopback audio lives. Why not a bash
-supervisor? MSYS2/Git-Bash cannot be launched reliably from Task
-Scheduler's context (the shell dies at DLL-init with exit code 1), and
-a shell loop with pid files and kill-by-name is fragile under system
-resource pressure. The OS already provides supervision primitives; the
-task below is all of them, configured.
+The GUI replaces what the tasks provided:
 
-### The `TeeHeeSender` task
+| Capability | Where it lives now |
+|---|---|
+| Start at logon | Settings -> **Open at login** |
+| Start streaming | Settings -> **Start streaming when teehee opens** |
+| Self-heal | Settings -> **Reconnect automatically** (2 s -> 30 s backoff) |
+| Single instance | The same `Local\TeeHeeSend` mutex; the GUI holds it while sending |
+| History | `<app-data>/teehee/logs/send.jsonl`, 1 Hz, rotating at 16 MiB |
+| Monitoring | Desktop alerts for sender errors, a silent loopback, ring and drift saturation |
 
-| Setting | Value | Why |
-|---|---|---|
-| Action | `T:\TeeHee\target\release\teehee.exe send --host <mac-ip> --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200` | The sender is a long-running loop; it needs no supervisor. `--log-file` is what makes a headless task observable (console output is discarded). |
-| Trigger | At logon | Interactive session → WASAPI loopback works. |
-| Trigger | Every 2 minutes (repeating) | Self-heal: if the sender is dead, the next firing restarts it within 2 minutes. |
-| Multiple instances | `IgnoreNew` | A firing while the sender is alive is skipped — never a duplicate stream. |
-| Execution time limit | Disabled (`PT0S`) | A long-running task must not be killed after 72 h. |
-| Start on battery | Allowed | A laptop at logon on battery must still start. |
-| Restart on failure | Every 1 min, up to 3× | Bonus; see the caveat below. |
-| Priority | Normal (`4`) | Audio pacing must not run at Task Scheduler's default below-normal priority. The sender also normalizes itself to `Normal` at startup when changing the task requires elevation. |
-
-### Single-instance guard
-
-`teehee send` holds a named mutex (`Local\TeeHeeSend`). A second
-`teehee send` exits immediately with:
-
-```
-Error: another teehee send instance is already running (single-instance mutex 'Local\TeeHeeSend'); exiting
-```
-
-The kernel destroys the mutex when the owning process exits, so a
-crash never leaves a stale lock — the next launch (or the 2-minute
-trigger) simply takes ownership. This is the native replacement for
-the old supervisor's kill-stale-senders + pid-file logic.
-
-### Re-registering the task
-
-Root-folder task registration requires an **elevated** prompt. Save
-this XML (adjust the `UserId`/SID, paths, and host to your machine),
-then:
-
-```powershell
-schtasks /create /tn TeeHeeSender /xml "C:\path\to\teehee_task.xml" /f
-```
-
-```xml
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Author>MERCURY\lsj50</Author>
-    <Description>teehee sender; runs teehee.exe directly (no bash supervisor). Self-heals via 2-min trigger + restart-on-failure.</Description>
-    <URI>\TeeHeeSender</URI>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id="Author">
-      <UserId>S-1-5-21-1767847710-1798288265-1333515972-1001</UserId>
-      <LogonType>InteractiveToken</LogonType>
-    </Principal>
-  </Principals>
-  <Settings>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <Priority>4</Priority>
-    <RestartOnFailure>
-      <Count>3</Count>
-      <Interval>PT1M</Interval>
-    </RestartOnFailure>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>true</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-  </Settings>
-  <Triggers>
-    <LogonTrigger>
-      <UserId>MERCURY\lsj50</UserId>
-    </LogonTrigger>
-    <TimeTrigger>
-      <StartBoundary>2026-08-23T00:00:00</StartBoundary>
-      <Repetition>
-        <Interval>PT2M</Interval>
-      </Repetition>
-    </TimeTrigger>
-  </Triggers>
-  <Actions Context="Author">
-    <Exec>
-      <Command>T:\TeeHee\target\release\teehee.exe</Command>
-      <Arguments>send --host 192.168.1.111 --port 5000 --capture-source=loopback --stats --chunk-ms 3 --log-file T:\TeeHee\logs\send.jsonl --capture-buffer-ms 1200</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-```
-
-To get your user's SID for the `<UserId>` element (or to confirm the
-task runs as you): `whoami /user`. The `StartBoundary` of the
-repeating trigger is when the 2-minute cadence anchors; it repeats
-indefinitely (no `Duration` = never stops).
-
-### Verifying
-
-```powershell
-schtasks /query /tn TeeHeeSender /v /fo LIST
-# Status: Running, Last Result: 267009 (SCHED_S_TASK_RUNNING) — healthy
-
-tasklist | findstr teehee
-# teehee.exe ...
-
-# Sender health lives in the JSONL log (one send_stats line per second):
-Get-Content T:\TeeHee\logs\send.jsonl -Tail 1
-```
-
-`Last Result 267009` while running is healthy; `1` means the last
-start failed (check the exe path and the log). While the task is
-running, an *ignored* 2-minute firing can surface
-`SCHED_E_USER_NOT_LOGGED_ON` (`0x80041320`) as the last result — that
-is cosmetic (the firing was skipped because the task was already
-running) and clears on the next real start.
-
-Task lifecycle events — start, fail, restart, and skipped (already
-running) firings — are recorded in the
-`Microsoft-Windows-TaskScheduler/Operational` event log (enabled):
-
-```powershell
-Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-TaskScheduler/Operational'; StartTime=(Get-Date).AddMinutes(-10)} |
-  Where-Object { $_.Message -match 'TeeHee' } | Format-List TimeCreated, Id, Message
-```
-
-### Caveat: Restart on failure
-
-Task Scheduler's "Restart on failure" does **not** fire for
-run-only-when-logged-on (`InteractiveToken`) tasks — a documented
-limitation. The 2-minute periodic trigger is the real self-heal
-mechanism and is verified to restart a killed sender within 2 minutes.
-The `RestartOnFailure` setting is kept as a harmless bonus.
-
-### Monitoring and alerting
-
-`logs/send.jsonl` is the monitoring surface: `send_start` on launch,
-then a `send_stats` record every second with `packets_sent`,
-`packets_per_sec`, `send_errors`, `capture_ring_ms`, and
-`send_drift_ppm`.
-
-`scripts/send_watch.ps1` is the operator's single alerting entry
-point, with two modes:
-
-* `-Watch` (default) — interactive foreground watcher: polls
-  `send.jsonl` every 10 s and alerts on state transitions (ring fill,
-  drift saturation, silent sender). Run via `just watch-send`.
-* `-Check` — one-shot health check for the `TeeHeeWatch` scheduled
-  task (every 5 min). Alerts only on NEW problems and recoveries
-  (state kept in `logs/send_watch.state`), so a stuck sender alerts
-  once, not every 5 minutes.
-
-Alerts append a timestamped line to `logs/send_alerts.log`, play an
-audible alert, and (in `-Check` mode) best-effort pop a message box.
-The watcher also alerts once when `capture_nonzero_samples` has not
-changed for 4 hours. WASAPI loopback stops producing data when the PC
-is idle, so this is informational unless audio should be playing; the
-alert recovers when non-silent samples resume or the sender restarts. Set
-`-CaptureQuietHours 0` to disable it or pass another hour threshold.
-Repeated drift-saturation transitions are rate-limited to one alert
-per 6 hours by default (`-DriftAlertCooldownMinutes 360`), while a
-sustained saturation remains a single active condition. Drift
-saturation is only alerted while non-silent audio has been captured
-within the last 2 minutes (`-DriftQuietSuppressSecs 120`): the
-compensator saturating while the capture engine is silent or idle is
-expected (ring drained, nothing streaming) and is suppressed, so
-these benign audio start/stop transitions do not page the operator.
-
-The "sender down" check uses a 240 s stale threshold: the sender task
-self-heals within ~2 min, so stats older than 4 min mean self-healing
-has failed and the operator should look (`schtasks /run /tn
-TeeHeeSender` starts it manually).
-
-The `TeeHeeWatch` task runs `wscript.exe
-T:\TeeHee\scripts\send_watch_task.vbs` every 5 minutes. The VBScript
-launcher starts `send_watch.ps1 -Check` with `windowStyle 0` and waits
-for it, so neither the launcher nor PowerShell can flash a console
-window in the interactive session. It is PowerShell, not bash — Git
-Bash cannot be launched from Task Scheduler (the reason the sender
-task runs the exe directly), and PowerShell is native and
-task-launchable.
-
-For a manual foreground run of the sender (debugging), `just sender`
-runs the same command as the task.
-
-### Scheduled task installation
-
-All three monitoring tasks use VBScript launchers (`*.vbs`) so that
-neither the launcher nor PowerShell flashes a console window in the
-interactive session. Register them from an **elevated** prompt once
-per machine:
-
-```powershell
-# TeeHeeWatch: runs send_watch.ps1 -Check every 5 min (sender health)
-just install-watch
-
-# TeeHeeWatchdog: runs send_watchdog.ps1 every 10 min (watcher health)
-just install-watchdog
-
-# TeeHeeRotate: runs rotate_logs.ps1 daily (log size cap + archive prune)
-just install-rotate
-```
-
-Tasks run as the **installing user** with highest privileges (`/RL
-HIGHEST`) — not as `SYSTEM`. This is intentional: `msg.exe` desktop
-popups and `SystemSounds` alerts require an interactive session,
-which session-0 (`SYSTEM`) would swallow.
-
-### Watchdog (watcher-of-the-watcher)
-
-`scripts/send_watchdog.ps1` is a second-line defense. If the
-`TeeHeeWatch` task itself is disabled, its trigger breaks, or
-PowerShell is broken, the sender would go unmonitored indefinitely.
-The watchdog checks `logs/send_watch.heartbeat` (written by every
-`send_watch.ps1` run) and alerts if it goes stale beyond 15 min
-(`$StaleSecs = 900`):
-
-* A **stale heartbeat** (timestamp older than 15 min) triggers an
-  alert via the same channels (alerts log, sound, msg.exe popup).
-* A **missing heartbeat** is given the same 15-min grace period
-  (anchored by a `logs/send_watchdog.grace` sentinel) so the first
-  watchdog firing — before `TeeHeeWatch` has written the heartbeat —
-  does not false-alert. After the grace window, a still-missing file
-  means `TeeHeeWatch` was never installed or has been removed.
-* A **corrupt heartbeat** (non-numeric content) is treated as stale
-  with `age=unknown`; the alert still fires.
-
-### Log rotation
-
-`scripts/rotate_logs.ps1` caps log sizes so `send.jsonl` cannot grow
-unbounded (~150 MB/month). The `TeeHeeRotate` task runs it daily:
-
-* When `logs/send.jsonl` exceeds 100 MB (`$MaxSendMb`), it is
-  **copy-and-truncated**: the contents are copied to
-  `logs/archive/send-<timestamp>.jsonl`, then the live file is
-  truncated in place. The sender holds a process-lifetime append
-  handle on `send.jsonl` and never reopens by path, so a rename would
-  send future writes into the archive and the live file would never
-  be recreated. Copy-and-truncate keeps the sender writing at the
-  live path while the archive preserves the rotated data.
-* `logs/send_alerts.log` is rotated the same way at 1 MB
-  (`$MaxAlertMb`).
-* Archives are pruned: only the 8 newest (`$KeepArchives`) are kept,
-  and anything older than 90 days (`$RetainDays`) is deleted.
+The session log path is `%LOCALAPPDATA%/teehee/logs/send.jsonl` on Windows.
+Install the app from the release bundle, or run `nsh run App.tsx` from `gui/`
+for development. WASAPI loopback still requires an interactive logon session;
+there is no session-0 workaround.
 
 ## Firewall configuration
 
