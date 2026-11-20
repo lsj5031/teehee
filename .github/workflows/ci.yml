@@ -46,6 +46,44 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  # GUI prototype: NSH's own ci.yml runs check/build/test the same way.
+  # Uses the same pinned NSH release as the packaging job in release.yml.
+  gui:
+    name: gui (check, build, test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gui-ci
+
+      # QuickJS is C (bindgen needs libclang); the Linux backend links
+      # GTK 4 and GStreamer. Matches NSH's own CI dependency list.
+      - name: Install NSH build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libgtk-4-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install NSH CLI
+        env:
+          NSH_VERSION: v0.6.0
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: nsh check
+        run: nsh check gui
+
+      - name: nsh build
+        run: nsh build gui
+
+      - name: nsh test
+        run: nsh test gui
+
   # Debug tests only (fast). Release binaries are produced by release.yml.
   # Full OS matrix: cpal/WASAPI paths differ per platform.
   test:
